@@ -1,0 +1,146 @@
+# SR adapter for the answerability intrinsic on granite-4.2-3b.
+#
+# Hyperparameters are ported verbatim from intrinsics_training's own SR recipe,
+# configs/answerability/shadow_residual/sr_sharedkv_4.2_3b.yaml (r16 / alpha 32 /
+# dropout 0.05 / lr 5e-5 / 3 epochs / per_device_train 1 x grad_accum 8 /
+# max_length 8192 / seed 0). Training data is that repo's answerability raw
+# shards, converted by scripts/prepare_answerability_jsonl.py.
+#
+# Four settings DIFFER from that upstream recipe, each required by this
+# codebase rather than chosen:
+#
+#   1. `adapter.invocation_tokens` REMOVED. SR is now always-active plain LoRA
+#      (stock peft, no gating); the key is rejected outright by the config
+#      schema, which is `extra="forbid"`.
+#   2. `model.shared_base_kv` REMOVED. Shared base-only K/V is the single
+#      supported topology now, so the key is no longer accepted.
+#   3. `batch.gradient_checkpointing` flipped false -> true. Upstream set it
+#      false solely because SR forced it off whenever invocation_tokens was set
+#      (PEFT #2826). With plain LoRA the dual-stream decoder forward is pure, so
+#      HF's non-reentrant recompute is exact and checkpointing is safe.
+#   4. Boundary markers retargeted -- see the block on assistant_marker below.
+#      This is the one change that alters what gets supervised, so it is spelled
+#      out rather than left implicit.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ibm-granite/granite-4.2-3b
+  # Left unset => bf16, which is what the prior successful 3b run used. The
+  # schema docstring recommends fp32 master weights at 8B/30B scale; at 3B bf16
+  # was stable across every recorded run.
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 8192
+
+  # MUST include the empty think block. Verified against granite-4.2-3b's
+  # published chat_template.jinja: in the assistant branch, when the content is a
+  # string containing neither <think> nor </think>, the template rewrites it to
+  #     content = "<think></think>" ~ content
+  # UNCONDITIONALLY -- `enable_thinking` is read only inside the
+  # `add_generation_prompt` block, so it does NOT suppress this. A training row
+  # therefore renders as:
+  #     <|im_start|>assistant\n<think></think>"answerable"<|im_end|>\n
+  # and inference with add_generation_prompt=True + enable_thinking=False ends
+  # the prompt at exactly ...<|im_start|>assistant\n<think></think>.
+  #
+  # ResponseOnlyCollator masks through the LAST occurrence of this marker, so
+  # supervision starts on the first token the model actually generates at serving
+  # time. Anchoring at "<|im_start|>assistant\n" instead (what both prior
+  # pipelines did -- the published intrinsics adapter records
+  # alora_invocation_tokens [100256, 78191, 198] = <|im_start|>/assistant/\n)
+  # leaves <think></think> inside the supervised region, training the model to
+  # emit three tokens that are always supplied by the prompt. Not fatal, but it
+  # mismatches inference; the measured 0.914 baseline was obtained that way, so
+  # treat a comparison against it as approximate rather than controlled.
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+  # No-op for training rows (see above) but correct for the generation prompt
+  # used by generate.py / answerability_eval, which must not open a <think> block.
+  enable_thinking: false
+
+adapter:
+  # k_proj / v_proj are deliberately absent: K and V are computed once from the
+  # base stream and shared, so there is nowhere for a K/V delta to land. Listing
+  # them is rejected at build time.
+  target_modules:
+    q_proj: 16
+    o_proj: 16
+    gate_proj: 16
+    up_proj: 16
+    down_proj: 16
+    cross_stream: 16
+  alpha: 32
+  dropout: 0.05
+
+  # Both must encode to exactly ONE token id for this tokenizer or train.py
+  # raises. Verified against granite-4.2-3b's tokenizer_config.json:
+  #   </think>    -> 100275
+  #   <|im_end|>  -> 100257  (also eos_token and pad_token)
+  # last_context_token is the final token of assistant_marker, so train.py's
+  # validate_last_context_token_boundary check is self-consistent: it asserts the
+  # token immediately before the first unmasked label is this one.
+  last_context_token: "</think>"
+  # End-of-completion marker. train.py appends it to any row not already ending
+  # in it, comparing against the last NON-WHITESPACE token -- which matters here
+  # because the ChatML template emits "<|im_end|>\n", so a naive check on the
+  # literal last token would see the newline and double the terminator.
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch        # not the schema default paged_adamw_8bit, which needs bitsandbytes
+  learning_rate: 5.0e-05
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 1
+  gradient_accumulation: 8   # 1 GPU * 1 * 8 = effective batch 8
+  per_device_eval: 4
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  # Inert at 3 epochs and cannot fire (epoch 1 sets the initial best, so at most
+  # 2 consecutive non-improvements can accumulate). Kept so that raising
+  # num_train_epochs does not silently lose the guard -- but if you raise it,
+  # set this to null in the SAME commit or the run may stop early.
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  # 3 epochs, limit 3 => every epoch's checkpoint survives, so any of them can be
+  # re-scored afterwards without retraining. Checkpoint selection has previously
+  # accounted for an apparent SR-vs-LoRA gap, so keeping all three is cheap
+  # insurance: only the ~30.5M trainable params are written, not the base model.
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 3
+  seed: 0
+  logging_steps: 1
+  dataloader_num_workers: 4
+  # tensorboard, not wandb: matches the upstream recipe. The build YAML also sets
+  # WANDB_MODE=disabled so the HF WandbCallback is a no-op.
+  report_to: [tensorboard]
+
+generation:
+  # Only used if post-training generation is enabled. byoc_run.sh always passes
+  # --skip-post-train-generate and evaluates with answerability_eval instead, but
+  # the block is kept so `python -m shadow_residual.training.generate` works
+  # against a saved checkpoint without a second config.
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 32
+  do_sample: false
+  batch_size: 8
+  output_filename: predictions.jsonl

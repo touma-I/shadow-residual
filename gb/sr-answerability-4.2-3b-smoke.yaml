@@ -1,0 +1,107 @@
+### Shadow Residual answerability adapter on granite-4.2-3b -- SMOKE run.
+###
+### Intrinsic: answerability
+### Model:     ibm-granite/granite-4.2-3b
+### Type:      Shadow Residual (cross_stream + shared base-only K/V, always-active
+###            plain LoRA -- no gating)
+###
+### Purpose: prove the pipeline end to end for ~25 min before committing the
+### ~10 h full run. It validates, in order: that the step can clone THIS repo
+### from public github.com (the one unverified assumption), that git-lfs pulls
+### real data rather than pointers, that the migrated SR config loads against the
+### current schema, and that training takes real optimizer steps.
+###
+### Step arithmetic: SMOKE_SUBSAMPLE 2000 -> 1800 train rows / effective batch 8
+### = 225 steps per epoch, so the 20-step cap cannot degenerate to zero steps
+### (a zero-step run exits 0 and reports SUCCESS having done nothing).
+### train.py's trainer.save_model() writes a loadable adapter at the output root
+### regardless of save.strategy, so 20 steps still produces something scoreable.
+###
+### Submit to space `public` (where steps/custom_code_lsf and
+### environments/bluevela live):
+###   gb build validate --filename gb/sr-answerability-4.2-3b-smoke.yaml --space public --skip-version-check
+###   gb build start    --filename gb/sr-answerability-4.2-3b-smoke.yaml --space public --skip-version-check
+###
+### github_ref MUST be an immutable full SHA: the ref resolves when the LSF job
+### STARTS, so a push to the branch while this sits in PEND would change what it
+### clones.
+
+granite.build:
+  name: sr-answerability-4.2-3b-smoke
+  targets:
+    train:
+      # Required. Omitting it is the classic first-attempt failure.
+      environment_uri: space://environments/bluevela
+      steps:
+        - step_uri: "space://steps/custom_code_lsf"
+          config:
+            compute_config:
+              num_nodes: 1              # schema pins this to 1
+              num_gpus_per_node: 1
+              num_cpus_per_node: 8
+              total_memory_per_node: 128Gi
+            lsf:
+              # Declaring this block REPLACES all 5 step defaults and the
+              # validator hard-errors at submit on any that go missing, so all 5
+              # are re-listed verbatim. WORKLOAD_GIT_PAT is the addition: the step
+              # drops GB_SDK_GIT_PAT before the workload phase, and
+              # scripts/byoc_run.sh needs a GHE PAT there to clone
+              # intrinsics_training and `git lfs pull` the training data.
+              secrets:
+                secret_names_to_use_as_env_variable:
+                  - { env_name: GB_SDK_GIT_PAT,         secret_name: GITHUB_IBM_PAT }
+                  - { env_name: CLEARML_API_HOST,       secret_name: CLEARML_API_HOST }
+                  - { env_name: CLEARML_API_ACCESS_KEY, secret_name: CLEARML_API_ACCESS_KEY }
+                  - { env_name: CLEARML_API_SECRET_KEY, secret_name: CLEARML_API_SECRET_KEY }
+                  - { env_name: HF_TOKEN,               secret_name: HF_TOKEN }
+                  - { env_name: WORKLOAD_GIT_PAT,       secret_name: GITHUB_IBM_PAT }
+              # No bsub queue/group override: bluevela already defaults to queue
+              # `normal` / group `grp_granite_dot_build`, and the flat `lsf.queue`
+              # form seen in some examples is a silent no-op.
+            byoc_config:
+              # Public github.com, not GHE. The step's resolve_ref.sh builds
+              # https://${GB_SDK_GIT_PAT}@${github_url}.git, interpolating the GHE
+              # token as the username; verified locally that github.com ignores an
+              # invalid credential for public-repo reads, so that is harmless. The
+              # config schema accepts any host.tld/path. What this run proves is
+              # that the compute node has egress to github.com at all.
+              github_url: "github.com/touma-I/shadow-residual"
+              github_ref: "REPLACE_WITH_COMMIT_SHA"
+              conda_lockfile_path: "environment.yml"
+              # The leading `ls` is a fail-fast guard: it runs in seconds during
+              # phase 3, before the ~50-minute conda env build, so a clone that
+              # landed without the BYOC files fails immediately instead of an hour
+              # in. Keep it from the FIRST build -- setup_command is part of the
+              # env cache key, so adding it later buys a fresh env build.
+              setup_command: >-
+                ls -la scripts/byoc_run.sh scripts/prepare_answerability_jsonl.py
+                src/shadow_residual/config/sr-answerability-4.2-3b.yaml >/dev/null &&
+                pip install --no-cache-dir -r requirements-byoc.txt
+              # Cache key = lockfile + setup_command + these files' contents.
+              # pyproject.toml is deliberately absent: we never install it, so
+              # including it would invalidate the env on unrelated edits.
+              dependency_files:
+                - "environment.yml"
+                - "requirements-byoc.txt"
+              start_command: "bash scripts/byoc_run.sh"
+              dir_to_save: "."
+              output_name: "sr-answerability-4.2-3b-smoke"
+              env:
+                WANDB_MODE: "disabled"
+                HF_HOME: "/proj/data-eng/llmb-read-write/hfcache/"
+                # Variable sequence lengths at max_length 8192 fragment the allocator.
+                PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+                # Progress bars must stay off: a tqdm bar is one giant
+                # CR-delimited "line", and gbserver's log tailer bkills the job
+                # once a line exceeds 64 KiB. The wrapper defaults this too; set
+                # here as well so it is visible in build_describe.
+                TQDM_DISABLE: "1"
+                SR_CONFIG: "src/shadow_residual/config/sr-answerability-4.2-3b.yaml"
+                # A ref NAME, not a SHA: the wrapper uses `git clone --branch`,
+                # which cannot take a raw commit id. This tag is the fork's main
+                # immediately after the 2026-09-28 upstream sync.
+                INTRINSICS_REF: "sr-run-2026-09-28"
+                EVAL_BATCH_SIZE: "4"
+                SMOKE_MAX_ROWS: "5000"
+                SMOKE_SUBSAMPLE: "2000"
+                SMOKE_MAX_STEPS: "20"
