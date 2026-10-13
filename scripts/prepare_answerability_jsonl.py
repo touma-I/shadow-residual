@@ -16,6 +16,15 @@ install of intrinsics_training, and none of its conflicting pins.
 Defaults inherited from that module: subsample 40000, seed 42, test_size 0.1,
 max_rows 400000.
 
+Over-length rows are DROPPED rather than trained on, mirroring
+intrinsics_training's own export (`drop_overlength: true`). Answerability's label
+is the last thing in the sequence, so a row longer than max_length loses its
+completion to right-truncation and silently becomes an unlabeled example that
+contributes no gradient. Measured on the real shards, ~8% of rows exceed 8192.
+The length is measured through the exact training path -- load_jsonl_dataset,
+which renders the chat template and appends last_token -- so the count cannot
+drift from what the trainer sees.
+
 Output row shape, matching shadow_residual.training.data.load_jsonl_dataset:
 
     {"messages": [...], "documents": [...]}    # documents optional
@@ -41,6 +50,30 @@ from pathlib import Path
 _POINTER_MAX_BYTES = 1000
 
 
+def _write(path, rows) -> None:
+    with path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def _fits(path, tokenizer, max_length, enable_thinking, last_token) -> set:
+    """Return the indices of rows that survive right-truncation at max_length.
+
+    Measures through load_jsonl_dataset -- the same call the trainer makes -- so
+    the rendered template and the appended last_token are accounted for exactly.
+    """
+    from shadow_residual.training.data import load_jsonl_dataset  # noqa: E402
+
+    ds = load_jsonl_dataset(
+        path, tokenizer, enable_thinking=enable_thinking, last_token=last_token
+    )
+    keep = set()
+    for i, text in enumerate(ds["text"]):
+        if len(tokenizer(text, add_special_tokens=False)["input_ids"]) < max_length:
+            keep.add(i)
+    return keep
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--intrinsics-repo", required=True, type=Path,
@@ -55,6 +88,12 @@ def main() -> int:
                    help="Shuffle/split seed. Default: the transform module's own (42).")
     p.add_argument("--test-size", type=float, default=None,
                    help="Validation fraction. Default: the transform module's own (0.1).")
+    p.add_argument("--sr-config", type=Path, default=None,
+                   help="SR training YAML. When given, over-length rows are dropped using "
+                        "its model.base / data.max_length / data.enable_thinking / "
+                        "adapter.last_token, so the filter cannot disagree with training.")
+    p.add_argument("--no-drop-overlength", action="store_true",
+                   help="Keep rows that exceed max_length (they will train unlabeled).")
     args = p.parse_args()
 
     tf_dir = args.intrinsics_repo / "standardization" / "data_transformation"
@@ -106,25 +145,62 @@ def main() -> int:
     print(f"[prep] transform produced {len(ds)} rows", flush=True)
     folds = T.finalize_folds(ds, **fold_kwargs)
 
+    # Resolve the over-length filter from the SR config, so one file is the
+    # single source of truth for max_length and the rendering options.
+    tok = max_length = enable_thinking = last_token = None
+    if args.sr_config is not None and not args.no_drop_overlength:
+        from transformers import AutoTokenizer  # noqa: E402 -- optional, only for filtering
+
+        from shadow_residual.config.training_config import load_training_config  # noqa: E402
+
+        cfg = load_training_config(str(args.sr_config))
+        max_length = cfg.data.max_length
+        enable_thinking = cfg.data.enable_thinking
+        last_token = cfg.adapter.last_token
+        print(f"[prep] drop-overlength ON: max_length={max_length} "
+              f"tokenizer={cfg.model.base} enable_thinking={enable_thinking} "
+              f"last_token={last_token!r}", flush=True)
+        tok = AutoTokenizer.from_pretrained(cfg.model.base)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+    elif args.no_drop_overlength:
+        print("[prep] drop-overlength DISABLED by flag", flush=True)
+    else:
+        print("[prep] drop-overlength OFF (no --sr-config given)", flush=True)
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     # intrinsics' finalize_folds names the held-out fold "test"; SR's config
     # refers to it as val.jsonl. Same data, different filename.
     for split_name, jsonl_name in (("train", "train.jsonl"), ("test", "val.jsonl")):
         out_path = args.out_dir / jsonl_name
-        n = n_with_docs = 0
-        with out_path.open("w") as f:
-            for row in folds[split_name]:
-                messages = list(row["prompt"]) + list(row["completion"])
-                kwargs = row.get("chat_template_kwargs") or {}
-                docs = kwargs.get("documents") if isinstance(kwargs, dict) else None
-                out_row: dict = {"messages": messages}
-                if docs:
-                    out_row["documents"] = docs
-                    n_with_docs += 1
-                f.write(json.dumps(out_row) + "\n")
-                n += 1
-        print(f"[prep] wrote {n} rows ({n_with_docs} with documents) -> {out_path}", flush=True)
-        if n == 0:
+        rows = []
+        n_with_docs = 0
+        for row in folds[split_name]:
+            messages = list(row["prompt"]) + list(row["completion"])
+            kwargs = row.get("chat_template_kwargs") or {}
+            docs = kwargs.get("documents") if isinstance(kwargs, dict) else None
+            out_row: dict = {"messages": messages}
+            if docs:
+                out_row["documents"] = docs
+                n_with_docs += 1
+            rows.append(out_row)
+
+        _write(out_path, rows)
+        n_before = len(rows)
+
+        if tok is not None:
+            keep = _fits(out_path, tok, max_length, enable_thinking, last_token)
+            if len(keep) < n_before:
+                rows = [r for i, r in enumerate(rows) if i in keep]
+                _write(out_path, rows)
+            dropped = n_before - len(rows)
+            pct = (100.0 * dropped / n_before) if n_before else 0.0
+            print(f"[prep] {jsonl_name}: dropped {dropped}/{n_before} rows "
+                  f"({pct:.1f}%) over max_length={max_length}", flush=True)
+
+        print(f"[prep] wrote {len(rows)} rows ({n_with_docs} with documents, pre-filter) "
+              f"-> {out_path}", flush=True)
+        if not rows:
             print(f"ERROR: {jsonl_name} is empty", file=sys.stderr)
             return 2
 

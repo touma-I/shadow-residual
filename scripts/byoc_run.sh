@@ -176,6 +176,15 @@ fi
 
 if [ "$EVAL_ONLY" != "1" ]; then
 
+  # Resolve the SR training config once: both the data prep (for its max_length)
+  # and training below read it, and they must not disagree.
+  SR_CONFIG_REL="${SR_CONFIG:-src/shadow_residual/config/sr-answerability-4.2-3b.yaml}"
+  case "$SR_CONFIG_REL" in
+    /*) CFG_FOR_PREP="$SR_CONFIG_REL" ;;
+    *)  CFG_FOR_PREP="$REPO_ROOT/$SR_CONFIG_REL" ;;
+  esac
+  [ -f "$CFG_FOR_PREP" ] || { echo "ERROR: SR config not found: $CFG_FOR_PREP" >&2; exit 1; }
+
   # --- 2. Convert raw -> SR messages-JSONL ---
   DATA_DIR="$OUTPUT_PATH/data"
   mkdir -p "$DATA_DIR"
@@ -183,9 +192,14 @@ if [ "$EVAL_ONLY" != "1" ]; then
   [ -n "${SMOKE_MAX_ROWS:-}"  ] && CONV_ARGS+=(--max-rows  "$SMOKE_MAX_ROWS")
   [ -n "${SMOKE_SUBSAMPLE:-}" ] && CONV_ARGS+=(--subsample "$SMOKE_SUBSAMPLE")
   echo "=== convert to SR JSONL ${CONV_ARGS[*]:-} ==="
+  # --sr-config drives the over-length filter off the SAME file training uses, so
+  # max_length cannot drift between the two. Answerability's label is last in the
+  # sequence, so a row over max_length would lose it to right-truncation and
+  # train unlabeled; ~8% of the real shards exceed 8192.
   python "$REPO_ROOT/scripts/prepare_answerability_jsonl.py" \
     --intrinsics-repo "$INTRINSICS_DIR" \
     --out-dir "$DATA_DIR" \
+    --sr-config "$CFG_FOR_PREP" \
     "${CONV_ARGS[@]}" 2>&1 | cr_filter
   PREP_RC=${PIPESTATUS[0]}
   [ "$PREP_RC" -eq 0 ] || { echo "ERROR: data prep failed rc=$PREP_RC" >&2; exit "$PREP_RC"; }
@@ -195,12 +209,7 @@ if [ "$EVAL_ONLY" != "1" ]; then
   head -c 600 "$DATA_DIR/train.jsonl" && echo
 
   # --- 3. Train ---
-  SR_CONFIG_REL="${SR_CONFIG:-src/shadow_residual/config/sr-answerability-4.2-3b.yaml}"
-  case "$SR_CONFIG_REL" in
-    /*) CFG="$SR_CONFIG_REL" ;;
-    *)  CFG="$REPO_ROOT/$SR_CONFIG_REL" ;;
-  esac
-  [ -f "$CFG" ] || { echo "ERROR: SR config not found: $CFG" >&2; exit 1; }
+  CFG="$CFG_FOR_PREP"
   echo "SR config: $CFG"
   echo "=== SR config contents ==="
   cat "$CFG"
