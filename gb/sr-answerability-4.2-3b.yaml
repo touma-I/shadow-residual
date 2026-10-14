@@ -85,7 +85,7 @@ granite.build:
               # MUST be an immutable full SHA on THIS branch (the gb/ layout). The
               # ref resolves when the LSF job STARTS, so a branch name would let a
               # push mid-PEND change what gets cloned. Repin after any code change.
-              github_ref: "REPLACE_WITH_COMMIT_SHA"
+              github_ref: "50602e399270eaa88cc27fbafc25407b331cf68c"
               conda_lockfile_path: "gb/environment.yml"
               # The leading `ls` is a fail-fast guard: it runs in seconds during
               # phase 3, before the ~50-minute conda env build, so a clone that
