@@ -188,6 +188,15 @@ if [ "$EVAL_ONLY" != "1" ]; then
   # --- 2. Convert raw -> SR messages-JSONL ---
   DATA_DIR="$OUTPUT_PATH/data"
   mkdir -p "$DATA_DIR"
+
+  # Exported BEFORE the prep step, not just before training. The SR config
+  # references ${DATA_ROOT} / ${RUN_DIR} / ${EVAL_DATA}, and anything that loads
+  # that config through load_training_config resolves them eagerly and raises
+  # KeyError when one is unset. The prep step reads the YAML raw so it no longer
+  # needs them, but exporting here keeps any future config reader safe.
+  export DATA_ROOT="$DATA_DIR"
+  export EVAL_DATA="$DATA_DIR/val.jsonl"
+  export RUN_DIR="$OUTPUT_PATH"
   CONV_ARGS=()
   [ -n "${SMOKE_MAX_ROWS:-}"  ] && CONV_ARGS+=(--max-rows  "$SMOKE_MAX_ROWS")
   [ -n "${SMOKE_SUBSAMPLE:-}" ] && CONV_ARGS+=(--subsample "$SMOKE_SUBSAMPLE")
@@ -228,13 +237,6 @@ if [ "$EVAL_ONLY" != "1" ]; then
   echo "=== tokenizer probe ==="
   python "$REPO_ROOT/scripts/probe_tokenizer.py" --model "$PROBE_MODEL_RESOLVED" 2>&1 | cr_filter || \
     echo "(probe failed; continuing so any real error surfaces in training)"
-
-  # The config loader resolves ${VAR} BEFORE CLI overrides are applied and raises
-  # KeyError on an unset one, so these must be exported even though the CLI flags
-  # below also set the same paths.
-  export DATA_ROOT="$DATA_DIR"
-  export EVAL_DATA="$DATA_DIR/val.jsonl"
-  export RUN_DIR="$OUTPUT_PATH"
 
   TRAIN_EXTRA=()
   [ -n "${SMOKE_MAX_STEPS:-}" ] && TRAIN_EXTRA+=(--max-steps "$SMOKE_MAX_STEPS")

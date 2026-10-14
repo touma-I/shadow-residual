@@ -149,18 +149,31 @@ def main() -> int:
     # single source of truth for max_length and the rendering options.
     tok = max_length = enable_thinking = last_token = None
     if args.sr_config is not None and not args.no_drop_overlength:
+        import yaml  # noqa: E402
+
         from transformers import AutoTokenizer  # noqa: E402 -- optional, only for filtering
 
-        from shadow_residual.config.training_config import load_training_config  # noqa: E402
-
-        cfg = load_training_config(str(args.sr_config))
-        max_length = cfg.data.max_length
-        enable_thinking = cfg.data.enable_thinking
-        last_token = cfg.adapter.last_token
+        # Read the YAML directly rather than through load_training_config. That
+        # loader resolves ${VAR} references and raises KeyError on any that is
+        # unset -- including save.output_dir's ${RUN_DIR} and data.*_path's
+        # ${DATA_ROOT}, which are output paths this script neither has nor needs
+        # at prep time. The four fields below never contain ${VAR}.
+        raw = yaml.safe_load(args.sr_config.read_text())
+        data_blk = raw.get("data") or {}
+        adapter_blk = raw.get("adapter") or {}
+        base_model = (raw.get("model") or {}).get("base")
+        if not base_model:
+            print(f"ERROR: {args.sr_config} has no model.base", file=sys.stderr)
+            return 2
+        # Defaults mirror the TrainingConfig schema so an omitted key behaves the
+        # same here as it will in training.
+        max_length = data_blk.get("max_length", 8192)
+        enable_thinking = data_blk.get("enable_thinking", False)
+        last_token = adapter_blk.get("last_token")
         print(f"[prep] drop-overlength ON: max_length={max_length} "
-              f"tokenizer={cfg.model.base} enable_thinking={enable_thinking} "
+              f"tokenizer={base_model} enable_thinking={enable_thinking} "
               f"last_token={last_token!r}", flush=True)
-        tok = AutoTokenizer.from_pretrained(cfg.model.base)
+        tok = AutoTokenizer.from_pretrained(base_model)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
     elif args.no_drop_overlength:
