@@ -93,8 +93,8 @@ Measured where measured, and labelled where not:
 
 | Phase | Time | Source |
 |---|---|---|
-| Cold conda env: repo clone + `conda env create` + full pip install | **~5 min** | measured, `f8bfeb40` — job start 23:36:14 → first training step 23:41:15, and that 5 min also covered the intrinsics clone, LFS pull, data prep and model load |
-| Setup on the full dataset (warm env) | **31 min** | measured, 3b build `0f7a356d` — dominated by the over-length filter tokenizing all 14.3k rows. Model-independent apart from the model download, so it should hold here |
+| Everything before the first training step, **with a cold conda env**: repo clone + `conda env create` + full pip install + intrinsics clone + LFS pull + full data prep + model load | **23 min** | measured, 3b build `fb991c9d` on this exact layout — step start 13:48:45, `cache: MISS`, first training step 14:11:46. Dominated by the over-length filter tokenizing all 14.3k rows, not by the env (a cold env alone measured ~5 min on `f8bfeb40`) |
+| Same, warm env | **31 min** | measured, 3b build `0f7a356d`. Yes — *longer* than the cold-env run above, which is the point: the env is noise next to the tokenizing pass |
 | Train + eval, 3 epochs, 1 GPU | **~11-14 h** | *estimate.* The prior 8b run `88e44a92` did 11h02m end to end on 1 GPU — but at `max_length` 4096, so 8192 should cost more. The same recipe at 3b took 5h12m |
 | End to end | **~11-14 h** | as above; 3b was 5h47m |
 
