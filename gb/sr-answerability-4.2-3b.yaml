@@ -11,18 +11,16 @@
 ### max_length (measured at 8.0% / 7.0%) leaves ~11.8k / ~1.3k. That is ~1,480
 ### steps per epoch, ~4,430 total.
 ###
-### Budget at least ~9h40m on 1 GPU -- that is what the prior successful 3b run
-### took, and it peaked at only 8.6 GB host RAM of the 128 Gi requested. Expect
-### somewhat longer here: that run had gradient checkpointing effectively off
-### (invocation_tokens forced it off), whereas this config enables it, trading
-### wall-clock for activation memory. Long runs are not a problem on this queue
-### -- a 3b 10-epoch run has completed at 24h35m and an 8b at ~35h.
+### Budget ~6 h on 1 GPU. MEASURED on build 0f7a356d (same code, same data, one
+### GPU): 31 min of setup, then 5h12m of train+eval, 5h47m end to end. It peaked
+### at 8.6 GB host RAM of the 128 Gi requested. The setup time is NOT the conda
+### env -- a cold env measured ~5 min on build f8bfeb40 -- it is the over-length
+### filter tokenizing all ~14.3k rows before training starts.
 ###
-### The smoke variant lives on branch gb/sr-4.2-smoke-test, not here. If you want
-### a cheap pipeline check before spending ~6 h, copy this file and add
-### SMOKE_MAX_ROWS=5000 / SMOKE_SUBSAMPLE=2000 / SMOKE_MAX_STEPS=20 to env.
-### Never run two builds concurrently while the conda env is still cold -- they
-### share CONDA_PKGS_DIRS and have been observed corrupting each other.
+### There is no smoke variant of this build on this branch, by design: it runs the
+### full recipe. Never run two builds concurrently while the conda env is still
+### cold -- they share CONDA_PKGS_DIRS and have been observed corrupting each
+### other.
 ###
 ### Submit to space `public` (where steps/custom_code_lsf and
 ### environments/bluevela live):
@@ -39,14 +37,20 @@ granite.build:
     train:
       # Required. Omitting it is the classic first-attempt failure.
       environment_uri: space://environments/bluevela
-      # Without this the step still succeeds and still writes checkpoints, but
-      # they live only under /proj/.../builds/llm-build-<id>/... and
-      # build_lineage returns []. Registering the fileset makes the adapter a
-      # first-class artifact.
-      outputs:
-        sr-answerability-4.2-3b:
-          uri: lh://{{ space.variables.DEFAULT_LH_ENVIRONMENT }}/{{ space.variables.DEFAULT_LH_NAMESPACE }}/filesets/{{ space.variables.DEFAULT_LH_FILESET_TABLE }}/sr-answerability-4.2-3b-{{ run_metadata.targetsteprun_id | short_hash }}/1/
-          type: fileset
+      # NO `outputs:` block, deliberately. Adding one appends an `lhpush` step,
+      # and on build 0f7a356d that step died on `401 Token is expired!` from
+      # `dmf fileset push` AFTER a flawless 5h47m train+eval -- turning a perfect
+      # run into a red build. Without it the step still succeeds and still writes
+      # every checkpoint, they just live under
+      # /proj/data-eng/llmb-read-write/builds/llm-build-<id>/... and
+      # build_lineage returns []. That is the intended place for now.
+      #
+      # To publish to the lakehouse instead, restore:
+      #   outputs:
+      #     sr-answerability-4.2-3b:
+      #       uri: lh://{{ space.variables.DEFAULT_LH_ENVIRONMENT }}/{{ space.variables.DEFAULT_LH_NAMESPACE }}/filesets/{{ space.variables.DEFAULT_LH_FILESET_TABLE }}/sr-answerability-4.2-3b-{{ run_metadata.targetsteprun_id | short_hash }}/1/
+      #       type: fileset
+      # The `lh://` templating itself resolved correctly; only the push failed.
       steps:
         - step_uri: "space://steps/custom_code_lsf"
           config:
@@ -87,19 +91,19 @@ granite.build:
               # push mid-PEND change what gets cloned. Repin after any code change.
               github_ref: "50602e399270eaa88cc27fbafc25407b331cf68c"
               conda_lockfile_path: "gb/environment.yml"
-              # The leading `ls` is a fail-fast guard: it runs in seconds during
-              # phase 3, before the ~50-minute conda env build, so a clone that
-              # landed without the BYOC files fails immediately instead of an hour
-              # in. Keep it from the FIRST build -- setup_command is part of the
-              # env cache key, so adding it later buys a fresh env build.
+              # The leading `ls` is a fail-fast guard: it runs in phase 3 the
+              # moment the env is ready, so a clone that landed without the BYOC
+              # files fails in seconds. Keep it from the FIRST build --
+              # setup_command is part of the env cache key, so adding it later
+              # buys a fresh env build for nothing.
               setup_command: >-
                 ls -la gb/byoc_run.sh gb/prepare_answerability_jsonl.py
                 gb/sr-train-config-4.2-3b.yaml >/dev/null &&
                 pip install --no-cache-dir -r gb/requirements-byoc.txt
-              # NOTE: moving these files under gb/ changed setup_command, which is
-              # part of the env cache key, so the first build on this layout pays a
-              # one-time ~50-minute conda env rebuild. The file CONTENTS are
-              # unchanged, so nothing else about the env differs.
+              # NOTE: the gb/ layout changed both setup_command and one comment
+              # line in environment.yml, so the first build here cannot reuse the
+              # earlier env and rebuilds it. That is cheap: a cold env measured
+              # ~5 min on build f8bfeb40, not the ~50 min often quoted.
               # Cache key = lockfile + setup_command + these files' contents.
               # pyproject.toml is deliberately absent: we never install it, so
               # including it would invalidate the env on unrelated edits.

@@ -68,20 +68,31 @@ Useful env knobs, all set in the build YAML's `env:` block:
 |---|---|
 | `SR_CONFIG` | which training config to use |
 | `INTRINSICS_REF` | intrinsics_training ref. Must be a ref **name** — `git clone --branch` cannot take a raw SHA |
-| `SMOKE_MAX_ROWS` / `SMOKE_SUBSAMPLE` / `SMOKE_MAX_STEPS` | shrink the run for a pipeline check |
 | `EVAL_ONLY=1` + `ADAPTER_PATH=<dir>` | score an existing adapter, no retraining |
 | `SKIP_EVAL=1` | train only |
 
-**Cheap pipeline check first.** A ~20-step smoke run costs ~25 min against ~6 h
-for the real thing. Add `SMOKE_MAX_ROWS=5000`, `SMOKE_SUBSAMPLE=2000`,
-`SMOKE_MAX_STEPS=20`. Check the step arithmetic when you shrink the input: 1800
-rows / effective batch 8 = 225 steps per epoch, so a 20-step cap is safe, but a
-cap below the batch size yields **zero** steps and a job that exits 0 having done
-nothing.
+There is deliberately **no smoke/shrink path here**: this recipe always runs the
+full dataset for the full 3 epochs. The row caps and step cap that existed during
+development were removed from `byoc_run.sh` on this branch, so there is no knob
+that can silently train on a subset. The transform's own defaults (`max_rows`
+400000, `subsample` 40000) both sit above the ~14.3k rows the shards yield, so
+neither bites.
 
-**Expect a one-time ~50-minute env rebuild** on the first run of this layout.
-Moving these files under `gb/` changed `setup_command`, which is part of the conda
-env cache key. File contents are unchanged, so nothing else about the env differs.
+### What it costs
+
+All measured, not estimated:
+
+| Phase | Time | Measured on |
+|---|---|---|
+| Cold conda env: repo clone + `conda env create` + full pip install | **~5 min** | `f8bfeb40` — job start 23:36:14 → first training step 23:41:15, and that 5 min also covered the intrinsics clone, LFS pull, data prep and model load |
+| Setup on the full dataset (warm env) | **31 min** | `0f7a356d` — dominated by the over-length filter tokenizing all 14.3k rows before training starts |
+| Train + eval, 3 epochs, 1 GPU | **5h12m** | `0f7a356d` |
+| End to end | **5h47m** | `0f7a356d` |
+
+So budget ~6 h, and note the **setup cost is the tokenizing pass, not the conda
+env**. A cold env is single-digit minutes here — if you see "~50 minutes" quoted
+for a BYOC env build, it does not match this workload. Peak host RAM was 8.6 GB
+of the 128 Gi requested.
 
 ## What this recipe does differently from upstream
 
@@ -164,6 +175,44 @@ Each of these cost a real build somewhere. Do not "clean them up".
 | Eval phase always `exit 0` | A bad eval must never invalidate a good adapter. |
 | intrinsics clone under `$REPO_ROOT`, not `$OUTPUT_PATH` | `dir_to_save: "."` uploads everything in `$OUTPUT_PATH`; cloning there would ship the whole training corpus with the artifact. |
 
+## Pre-flight checks
+
+Everything here is free and local, and all of it runs in under a minute. Run it
+before every submit — the one build that failed outright (`5cc97f9c`) failed
+because code changed after the last check and the check was not repeated.
+
+```bash
+# 1. The entrypoint parses. Catches quoting/continuation damage, though NOT a
+#    broken inline `python -c` body (see Traps).
+bash -n gb/byoc_run.sh
+
+# 2. The training config loads under the real extra="forbid" schema, with the
+#    ${VAR}s the wrapper exports. A schema rejection here costs a queue wait.
+PYTHONPATH=src DATA_ROOT=/tmp/d RUN_DIR=/tmp/r EVAL_DATA=/tmp/d/val.jsonl \
+  python -c "from shadow_residual.config.training_config import load_training_config as L; \
+             c=L('gb/sr-train-config-4.2-3b.yaml'); \
+             assert 'cross_stream' in c.adapter.target_modules; \
+             assert not {'k_proj','v_proj'} & set(c.adapter.target_modules); print('ok')"
+
+# 3. Data prep runs end to end against a local intrinsics clone. Use a small
+#    --subsample; the transform still reads all 7 shards, so the row count it
+#    reports ("transform produced 14277 rows") is the real one.
+PYTHONPATH=src python gb/prepare_answerability_jsonl.py \
+  --intrinsics-repo ~/intrinsics_training --out-dir /tmp/preptest \
+  --sr-config gb/sr-train-config-4.2-3b.yaml --subsample 300
+
+# 4. The build YAML validates. The flag is --filename, NOT --file.
+gb build validate --filename gb/sr-answerability-4.2-3b.yaml --space public --skip-version-check
+```
+
+Step 3 is the one worth insisting on: it exercises the import-by-path into
+intrinsics' `transforms` module, the positional record contract, the label
+strings and the over-length filter — the parts most likely to break silently
+rather than loudly.
+
+The SR model code itself is untouched by this directory, so `pytest` only needs
+running if you change something under `src/`.
+
 ## Results
 
 Full run — build **`0f7a356d-db43-4e86-b7eb-0ccb90d2be68`**, code at `07ed601`
@@ -235,15 +284,14 @@ github.com. It works, and the `github_url` schema accepts any `host.tld/path`
 interpolated as the URL username; github.com ignores an invalid credential for
 public-repo reads, so that is harmless.
 
-Also worked: the narrow LFS pull, the `outputs:` lakehouse registration (the
-`lh://` templating resolved), and the warm env cache — the full run reused the
-smoke run's env hash `byoc-7e6d7089b9225fcd` and started in seconds.
+Also worked: the narrow LFS pull, and the env cache — one run reused the other's
+env hash `byoc-7e6d7089b9225fcd` and started in seconds.
 
-**Failed, and why:**
+**Build history:**
 
-| Build | Outcome | Cause |
+| Build | Outcome | What it showed |
 |---|---|---|
-| `f8bfeb40` | **SUCCESS** | 20-step smoke. Proved clone, LFS, config load, training, eval. |
+| `f8bfeb40` | **SUCCESS** | 20-step pipeline check during development. Proved github.com clone, LFS, config load, training, eval. Its YAML lives on `gb/sr-4.2-smoke-test`. |
 | `5cc97f9c` | FAILED in data prep | `KeyError: 'Environment variable ${DATA_ROOT} is not set'`. The over-length filter called `load_training_config()`, which eagerly resolves every `${VAR}` — including output paths the prep step neither has nor needs. Fixed by reading the YAML with `yaml.safe_load` for the four scalar fields it actually wants. |
 | `0f7a356d` | train+eval **success**, build **failed** | The `lhpush` step died on `401 Token is expired!` from `dmf fileset push`. A platform credential issue, downstream of all the real work — the adapter and metrics are intact. A FAILED build can contain a fully successful run. |
 
@@ -286,11 +334,11 @@ orchestrator is alive; the LSF job can still be `PEND`. Confirm with
 
 ## Related branches
 
-- **`gb/sr-4.2-smoke-test`** — the development history, including
-  `gb/sr-answerability-4.2-3b-smoke.yaml` (the 20-step smoke build YAML, which is
-  deliberately **not** carried over here) and the pre-restructure layout where
-  these files sat in `scripts/` and `src/shadow_residual/config/`. Build
-  `0f7a356d`'s code (`07ed601`) is on that branch.
+- **`gb/sr-4.2-smoke-test`** — the development history: the pre-restructure
+  layout where these files sat in `scripts/` and `src/shadow_residual/config/`,
+  plus `sr-answerability-4.2-3b-smoke.yaml`, the 20-step pipeline-check build.
+  Neither that YAML nor any smoke knob is carried over here — this branch runs the
+  full recipe only. Build `0f7a356d`'s code (`07ed601`) is on that branch.
 
 ## Known rough edges
 
@@ -300,7 +348,9 @@ orchestrator is alive; the LSF job can still be `PEND`. Confirm with
   `config/*.yaml`), so a `pip install` of this repo will not carry it. Its
   `$schema` comment points back into the package by relative path.
 - The eval report mislabels every `--mode peft` adapter as "+ aLoRA".
-- The `outputs:` lakehouse block is what introduces the `lhpush` step, and hence
-  the possibility of a red build from an otherwise perfect run. Removing it keeps
-  checkpoints on `/proj` and builds green, at the cost of `build_lineage`
-  resolving to `[]`.
+- There is **no `outputs:` lakehouse block** in the build YAML on this branch.
+  That block is what appends the `lhpush` step, and hence the possibility of a red
+  build from an otherwise perfect run — which is exactly what happened to
+  `0f7a356d`. Without it, checkpoints stay on `/proj` and the build goes green, at
+  the cost of `build_lineage` resolving to `[]`. The commented-out block is kept in
+  the YAML for whenever the adapter should be published.

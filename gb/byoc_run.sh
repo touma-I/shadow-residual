@@ -17,9 +17,6 @@
 #   INTRINSICS_REF    branch/tag/SHA of intrinsics_training. MUST be a ref NAME --
 #                     `git clone --branch` cannot take a raw SHA. Default: the
 #                     sr-run-2026-09-28 tag.
-#   SMOKE_MAX_STEPS   cap optimizer steps (unset -> full training)
-#   SMOKE_MAX_ROWS    max rows per source shard at transform stage
-#   SMOKE_SUBSAMPLE   total rows after subsample
 #   EVAL_BATCH_SIZE   eval batch size (default 4)
 #   SKIP_EVAL=1       train only
 #   EVAL_ONLY=1       score ADAPTER_PATH from an earlier build; no data prep, no training
@@ -197,10 +194,10 @@ if [ "$EVAL_ONLY" != "1" ]; then
   export DATA_ROOT="$DATA_DIR"
   export EVAL_DATA="$DATA_DIR/val.jsonl"
   export RUN_DIR="$OUTPUT_PATH"
-  CONV_ARGS=()
-  [ -n "${SMOKE_MAX_ROWS:-}"  ] && CONV_ARGS+=(--max-rows  "$SMOKE_MAX_ROWS")
-  [ -n "${SMOKE_SUBSAMPLE:-}" ] && CONV_ARGS+=(--subsample "$SMOKE_SUBSAMPLE")
-  echo "=== convert to SR JSONL ${CONV_ARGS[*]:-} ==="
+  # No row caps: this recipe always runs the full dataset. The transform's own
+  # defaults (max_rows 400000, subsample 40000) are both above the ~14.3k rows the
+  # shards actually yield, so neither bites.
+  echo "=== convert to SR JSONL ==="
   # --sr-config drives the over-length filter off the SAME file training uses, so
   # max_length cannot drift between the two. Answerability's label is last in the
   # sequence, so a row over max_length would lose it to right-truncation and
@@ -208,8 +205,7 @@ if [ "$EVAL_ONLY" != "1" ]; then
   python "$REPO_ROOT/gb/prepare_answerability_jsonl.py" \
     --intrinsics-repo "$INTRINSICS_DIR" \
     --out-dir "$DATA_DIR" \
-    --sr-config "$CFG_FOR_PREP" \
-    "${CONV_ARGS[@]}" 2>&1 | cr_filter
+    --sr-config "$CFG_FOR_PREP" 2>&1 | cr_filter
   PREP_RC=${PIPESTATUS[0]}
   [ "$PREP_RC" -eq 0 ] || { echo "ERROR: data prep failed rc=$PREP_RC" >&2; exit "$PREP_RC"; }
 
@@ -238,9 +234,6 @@ if [ "$EVAL_ONLY" != "1" ]; then
   python "$REPO_ROOT/gb/probe_tokenizer.py" --model "$PROBE_MODEL_RESOLVED" 2>&1 | cr_filter || \
     echo "(probe failed; continuing so any real error surfaces in training)"
 
-  TRAIN_EXTRA=()
-  [ -n "${SMOKE_MAX_STEPS:-}" ] && TRAIN_EXTRA+=(--max-steps "$SMOKE_MAX_STEPS")
-
   # `python -m`, never the sr-train console script: the step builds the env at
   # <prefix>.tmp.<pid> and renames it, leaving every pip console script with a
   # dangling shebang that dies "bad interpreter" / exit 126. `python` is a real
@@ -255,7 +248,7 @@ if [ "$EVAL_ONLY" != "1" ]; then
       *)  ACCEL_CFG_ABS="$REPO_ROOT/$ACCEL_CFG" ;;
     esac
     [ -f "$ACCEL_CFG_ABS" ] || { echo "ERROR: accelerate config not found: $ACCEL_CFG_ABS" >&2; exit 1; }
-    echo "=== train (FSDP, $NUM_GPUS GPUs) ${TRAIN_EXTRA[*]:-} ==="
+    echo "=== train (FSDP, $NUM_GPUS GPUs) ==="
     python -m accelerate.commands.launch \
       --config_file "$ACCEL_CFG_ABS" \
       --num_processes "$NUM_GPUS" \
@@ -264,17 +257,15 @@ if [ "$EVAL_ONLY" != "1" ]; then
       --train-data "$DATA_DIR/train.jsonl" \
       --val-data "$DATA_DIR/val.jsonl" \
       --output-dir "$CKPT" \
-      --skip-post-train-generate \
-      "${TRAIN_EXTRA[@]}" 2>&1 | cr_filter
+      --skip-post-train-generate 2>&1 | cr_filter
   else
-    echo "=== train (single GPU) ${TRAIN_EXTRA[*]:-} ==="
+    echo "=== train (single GPU) ==="
     python -m shadow_residual.training.train \
       --config "$CFG" \
       --train-data "$DATA_DIR/train.jsonl" \
       --val-data "$DATA_DIR/val.jsonl" \
       --output-dir "$CKPT" \
-      --skip-post-train-generate \
-      "${TRAIN_EXTRA[@]}" 2>&1 | cr_filter
+      --skip-post-train-generate 2>&1 | cr_filter
   fi
   # PIPESTATUS[0], not $?: cr_filter always exits 0 and would mask a real failure.
   TRAIN_RC=${PIPESTATUS[0]}
