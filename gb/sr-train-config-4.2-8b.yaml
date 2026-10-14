@@ -1,10 +1,16 @@
-# SR adapter for the answerability intrinsic on granite-4.2-3b.
+# SR adapter for the answerability intrinsic on granite-4.2-8b.
 #
 # Hyperparameters are ported verbatim from intrinsics_training's own SR recipe,
-# configs/answerability/shadow_residual/sr_sharedkv_4.2_3b.yaml (r16 / alpha 32 /
+# configs/answerability/shadow_residual/sr_sharedkv_4.2_8b.yaml (r16 / alpha 32 /
 # dropout 0.05 / lr 5e-5 / 3 epochs / per_device_train 1 x grad_accum 8 /
 # max_length 8192 / seed 0). Training data is that repo's answerability raw
 # shards, converted by gb/prepare_answerability_jsonl.py.
+#
+# Note on provenance: that 8b file is the ONLY SR config intrinsics ships for
+# answerability -- there is no 3b sibling (unlike citations, hallucination
+# detection, query clarification and query rewrite, which have both). So this
+# file is the upstream recipe at its native size, and the 3b config on branch
+# gb/sr-ans-4.2-3b is the same recipe with the base model swapped down.
 #
 # Four settings DIFFER from that upstream recipe, each required by this
 # codebase rather than chosen:
@@ -17,7 +23,8 @@
 #   3. `batch.gradient_checkpointing` flipped false -> true. Upstream set it
 #      false solely because SR forced it off whenever invocation_tokens was set
 #      (PEFT #2826). With plain LoRA the dual-stream decoder forward is pure, so
-#      HF's non-reentrant recompute is exact and checkpointing is safe.
+#      HF's non-reentrant recompute is exact and checkpointing is safe. At 8B on
+#      one GPU this is also what keeps activations affordable at max_length 8192.
 #   4. Boundary markers retargeted -- see the block on assistant_marker below.
 #      This is the one change that alters what gets supervised, so it is spelled
 #      out rather than left implicit.
@@ -29,19 +36,42 @@
 # yaml-language-server: $schema=../src/shadow_residual/config/schema/training_config.schema.json
 
 model:
-  base: ibm-granite/granite-4.2-3b
-  # Left unset => bf16, which is what the prior successful 3b run used. The
-  # schema docstring recommends fp32 master weights at 8B/30B scale; at 3B bf16
-  # was stable across every recorded run.
+  base: ibm-granite/granite-4.2-8b
+  # NOT ibm-research/granite-4.2-8b. The earlier GHE-fork config used the
+  # ibm-research org, which now returns 401/404 from the Hub; ibm-granite
+  # resolves and carries the same ChatML tokenizer (verified below).
+  #
+  # Left unset => bf16. The schema docstring recommends fp32 master weights at
+  # 8B/30B scale, and that advice is aimed at FSDP (bf16 force-casts adapters
+  # down to satisfy flatten). This run is single-GPU with no FSDP, and the prior
+  # successful 8b run (build 88e44a92) trained in bf16, so bf16 is the
+  # known-good setting here. If loss goes NaN, `param_dtype: fp32` is the first
+  # thing to try -- `validation.stop_on_nan` below will catch it at epoch end.
 
 data:
   train_path: ${DATA_ROOT}/train.jsonl
   val_path:   ${DATA_ROOT}/val.jsonl
+
+  # 8192, matching upstream and the 3b run -- NOT the 4096 the GHE fork's 8b
+  # config used. That file justified 4096 with "the answerability rows are well
+  # under this length", which measurement contradicts. Measured on 3,000 real
+  # rows with THIS tokenizer: p50 779, p90 7332, p99 14926, max 19568 tokens.
+  # Because answerability's label is the LAST thing in the sequence, every row
+  # over max_length is dropped (gb/prepare_answerability_jsonl.py) rather than
+  # silently truncated into an unlabeled example, so max_length is a direct
+  # data-retention knob:
+  #       >= 8192 -> 8.2% of train rows dropped
+  #       >= 6144 -> 14.4%
+  #       >= 4096 -> 18.9%
+  # 8192 keeps the training set comparable to the 3b run (8.1% dropped there) at
+  # less than half the data loss of 4096. The cost is activation memory, which
+  # gradient checkpointing absorbs. If this OOMs it will do so in the first
+  # minutes of training; drop to 6144 then, and record the new drop rate.
   max_length: 8192
 
-  # MUST include the empty think block. Verified against granite-4.2-3b's
-  # published chat_template.jinja: in the assistant branch, when the content is a
-  # string containing neither <think> nor </think>, the template rewrites it to
+  # MUST include the empty think block. Verified against granite-4.2's published
+  # chat_template.jinja: in the assistant branch, when the content is a string
+  # containing neither <think> nor </think>, the template rewrites it to
   #     content = "<think></think>" ~ content
   # UNCONDITIONALLY -- `enable_thinking` is read only inside the
   # `add_generation_prompt` block, so it does NOT suppress this. A training row
@@ -57,7 +87,7 @@ data:
   # alora_invocation_tokens [100256, 78191, 198] = <|im_start|>/assistant/\n)
   # leaves <think></think> inside the supervised region, training the model to
   # emit three tokens that are always supplied by the prompt. Not fatal, but it
-  # mismatches inference; the measured 0.914 baseline was obtained that way, so
+  # mismatches inference; any published 8b baseline was obtained that way, so
   # treat a comparison against it as approximate rather than controlled.
   assistant_marker: "<|im_start|>assistant\n<think></think>"
 
@@ -80,9 +110,10 @@ adapter:
   dropout: 0.05
 
   # Both must encode to exactly ONE token id for this tokenizer or train.py
-  # raises. Verified against granite-4.2-3b's tokenizer_config.json:
+  # raises. Verified against ibm-granite/granite-4.2-8b's tokenizer -- the ids are
+  # IDENTICAL to 4.2-3b's, so these markers carry over unchanged:
   #   </think>    -> 100275
-  #   <|im_end|>  -> 100257  (also eos_token and pad_token)
+  #   <|im_end|>  -> 100257  (also eos_token)
   # last_context_token is the final token of assistant_marker, so train.py's
   # validate_last_context_token_boundary check is self-consistent: it asserts the
   # token immediately before the first unmasked label is this one.
@@ -104,8 +135,12 @@ scheduler:
 
 batch:
   per_device_train: 1
-  gradient_accumulation: 8   # 1 GPU * 1 * 8 = effective batch 8
-  per_device_eval: 4
+  gradient_accumulation: 8   # 1 GPU * 1 * 8 = effective batch 8, same as the 3b run
+  # 2, not the 3b run's 4: mid-training eval holds a full forward's activations
+  # for a 2.6x larger model. The separate answerability_eval pass is sized
+  # independently via EVAL_BATCH_SIZE in the build YAML, also 2 -- which is what
+  # the prior successful 8b run (88e44a92) used.
+  per_device_eval: 2
   gradient_checkpointing: true
 
 validation:
@@ -125,7 +160,8 @@ save:
   # 3 epochs, limit 3 => every epoch's checkpoint survives, so any of them can be
   # re-scored afterwards without retraining. Checkpoint selection has previously
   # accounted for an apparent SR-vs-LoRA gap, so keeping all three is cheap
-  # insurance: only the ~30.5M trainable params are written, not the base model.
+  # insurance: only the LoRA/cross_stream params are written, not the base model
+  # (30.5M at 3b; larger here, but still a small fraction of 8B).
   total_limit: 3
   output_dir: ${RUN_DIR}/checkpoints
 

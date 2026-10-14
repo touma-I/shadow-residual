@@ -1,21 +1,33 @@
-### Shadow Residual answerability adapter on granite-4.2-3b -- FULL run.
+### Shadow Residual answerability adapter on granite-4.2-8b -- FULL run.
 ###
 ### Intrinsic: answerability
-### Model:     ibm-granite/granite-4.2-3b
+### Model:     ibm-granite/granite-4.2-8b
 ### Type:      Shadow Residual (cross_stream + shared base-only K/V, always-active
 ###            plain LoRA -- no gating)
 ###
 ### Runs the full recipe: 3 epochs, effective batch 8. The raw shards yield
 ### ~14.3k rows, which is under the 40k subsample cap, so the subsample is a
 ### no-op; the 0.1 split gives ~12.8k train / ~1.4k val, and dropping rows over
-### max_length (measured at 8.0% / 7.0%) leaves ~11.8k / ~1.3k. That is ~1,480
-### steps per epoch, ~4,430 total.
+### max_length 8192 (measured at 8.2% / 6.0% with this tokenizer) leaves
+### ~11.8k / ~1.3k. That is ~1,480 steps per epoch, ~4,430 total.
 ###
-### Budget ~6 h on 1 GPU. MEASURED on build 0f7a356d (same code, same data, one
-### GPU): 31 min of setup, then 5h12m of train+eval, 5h47m end to end. It peaked
-### at 8.6 GB host RAM of the 128 Gi requested. The setup time is NOT the conda
-### env -- a cold env measured ~5 min on build f8bfeb40 -- it is the over-length
-### filter tokenizing all ~14.3k rows before training starts.
+### Budget ~11-14 h on 1 GPU. The prior successful 8b run (build 88e44a92,
+### 2026-08-20) took 11h02m end to end on 1 GPU / 200Gi -- but at max_length
+### 4096, so expect longer here at 8192. For scale: the same recipe at 3b took
+### 5h47m. Long runs are fine on this queue; a 3b 10-epoch run has completed at
+### 24h35m and an 8b at ~35h.
+###
+### Sized from that run: 1 GPU, 8 CPU, 200Gi (the 3b recipe uses 128Gi) and
+### EVAL_BATCH_SIZE 2 (3b uses 4).
+###
+### TODO -- next iteration: try 4 GPUs. gb/byoc_run.sh already switches to
+### `accelerate launch` with the bundled FSDP config when
+### LLMB_LSF_NUM_GPUS > 1, and the only config shipped is fsdp_4gpu.yaml, so the
+### supported values are 1 or 4. That path has NEVER been exercised by any of
+### these builds -- both the 3b and 8b successes were single-GPU -- so it needs a
+### run of its own rather than being folded into this one. Note also that
+### `param_dtype: fp32` in the training config becomes the recommended setting
+### under FSDP (bf16 force-casts adapters down to satisfy flatten).
 ###
 ### There is no smoke variant of this build on this branch, by design: it runs the
 ### full recipe. Never run two builds concurrently while the conda env is still
@@ -24,31 +36,31 @@
 ###
 ### Submit to space `public` (where steps/custom_code_lsf and
 ### environments/bluevela live):
-###   gb build validate --filename gb/sr-answerability-4.2-3b.yaml --space public --skip-version-check
-###   gb build start    --filename gb/sr-answerability-4.2-3b.yaml --space public --skip-version-check
+###   gb build validate --filename gb/sr-answerability-4.2-8b.yaml --space public --skip-version-check
+###   gb build start    --filename gb/sr-answerability-4.2-8b.yaml --space public --skip-version-check
 ###
 ### github_ref MUST be an immutable full SHA: the ref resolves when the LSF job
 ### STARTS, so a push to the branch while this sits in PEND would change what it
 ### clones.
 
 granite.build:
-  name: sr-answerability-4.2-3b
+  name: sr-answerability-4.2-8b
   targets:
     train:
       # Required. Omitting it is the classic first-attempt failure.
       environment_uri: space://environments/bluevela
       # NO `outputs:` block, deliberately. Adding one appends an `lhpush` step,
-      # and on build 0f7a356d that step died on `401 Token is expired!` from
-      # `dmf fileset push` AFTER a flawless 5h47m train+eval -- turning a perfect
-      # run into a red build. Without it the step still succeeds and still writes
-      # every checkpoint, they just live under
+      # and on the 3b build 0f7a356d that step died on `401 Token is expired!`
+      # from `dmf fileset push` AFTER a flawless 5h47m train+eval -- turning a
+      # perfect run into a red build. Without it the step still succeeds and
+      # still writes every checkpoint, they just live under
       # /proj/data-eng/llmb-read-write/builds/llm-build-<id>/... and
       # build_lineage returns []. That is the intended place for now.
       #
       # To publish to the lakehouse instead, restore:
       #   outputs:
-      #     sr-answerability-4.2-3b:
-      #       uri: lh://{{ space.variables.DEFAULT_LH_ENVIRONMENT }}/{{ space.variables.DEFAULT_LH_NAMESPACE }}/filesets/{{ space.variables.DEFAULT_LH_FILESET_TABLE }}/sr-answerability-4.2-3b-{{ run_metadata.targetsteprun_id | short_hash }}/1/
+      #     sr-answerability-4.2-8b:
+      #       uri: lh://{{ space.variables.DEFAULT_LH_ENVIRONMENT }}/{{ space.variables.DEFAULT_LH_NAMESPACE }}/filesets/{{ space.variables.DEFAULT_LH_FILESET_TABLE }}/sr-answerability-4.2-8b-{{ run_metadata.targetsteprun_id | short_hash }}/1/
       #       type: fileset
       # The `lh://` templating itself resolved correctly; only the push failed.
       steps:
@@ -56,9 +68,13 @@ granite.build:
           config:
             compute_config:
               num_nodes: 1              # schema pins this to 1
+              # 1 for now -- the known-good path. See the 4-GPU TODO above.
               num_gpus_per_node: 1
               num_cpus_per_node: 8
-              total_memory_per_node: 128Gi
+              # 200Gi, not the 3b recipe's 128Gi: copied from the prior
+              # successful 8b run. Host RAM is cheap here and the 3b run peaked
+              # at only 8.6 GB, so this is headroom rather than a measured need.
+              total_memory_per_node: 200Gi
             lsf:
               # Declaring this block REPLACES all 5 step defaults and the
               # validator hard-errors at submit on any that go missing, so all 5
@@ -83,13 +99,14 @@ granite.build:
               # https://${GB_SDK_GIT_PAT}@${github_url}.git, interpolating the GHE
               # token as the username; github.com ignores an invalid credential for
               # public-repo reads, so that is harmless. The config schema accepts
-              # any host.tld/path, and builds f8bfeb40 / 0f7a356d both cloned this
-              # repo from github.com on a BlueVela compute node successfully.
+              # any host.tld/path, and builds f8bfeb40 / 0f7a356d / fb991c9d all
+              # cloned this repo from github.com on a BlueVela compute node.
               github_url: "github.com/touma-I/shadow-residual"
-              # MUST be an immutable full SHA on THIS branch (the gb/ layout). The
-              # ref resolves when the LSF job STARTS, so a branch name would let a
-              # push mid-PEND change what gets cloned. Repin after any code change.
-              github_ref: "11f4669c9b25dcd5a416b6bbe86f49ff032fe2fd"
+              # MUST be an immutable full SHA on THIS branch (gb/sr-ans-4.2-8b).
+              # The ref resolves when the LSF job STARTS, so a branch name would
+              # let a push mid-PEND change what gets cloned. Repin after any
+              # code change.
+              github_ref: "REPLACE_WITH_SHA"
               conda_lockfile_path: "gb/environment.yml"
               # The leading `ls` is a fail-fast guard: it runs in phase 3 the
               # moment the env is ready, so a clone that landed without the BYOC
@@ -98,13 +115,13 @@ granite.build:
               # buys a fresh env build for nothing.
               setup_command: >-
                 ls -la gb/byoc_run.sh gb/prepare_answerability_jsonl.py
-                gb/sr-train-config-4.2-3b.yaml >/dev/null &&
+                gb/sr-train-config-4.2-8b.yaml >/dev/null &&
                 pip install --no-cache-dir -r gb/requirements-byoc.txt
-              # NOTE: the gb/ layout changed both setup_command and one comment
-              # line in environment.yml, so the first build here cannot reuse the
-              # earlier env and rebuilds it. That is cheap: a cold env measured
-              # ~5 min on build f8bfeb40, not the ~50 min often quoted.
               # Cache key = lockfile + setup_command + these files' contents.
+              # This branch's setup_command names the 8b config, so it hashes
+              # differently from the 3b branch's and the first run here builds its
+              # own env. That is cheap: a cold env measured ~5 min on build
+              # f8bfeb40, not the ~50 min often quoted.
               # pyproject.toml is deliberately absent: we never install it, so
               # including it would invalidate the env on unrelated edits.
               dependency_files:
@@ -112,20 +129,22 @@ granite.build:
                 - "gb/requirements-byoc.txt"
               start_command: "bash gb/byoc_run.sh"
               dir_to_save: "."
-              output_name: "sr-answerability-4.2-3b"
+              output_name: "sr-answerability-4.2-8b"
               env:
                 WANDB_MODE: "disabled"
                 HF_HOME: "/proj/data-eng/llmb-read-write/hfcache/"
-                # Variable sequence lengths at max_length 8192 fragment the allocator.
+                # Variable sequence lengths at max_length 8192 fragment the
+                # allocator, and that matters more at 8B than at 3B.
                 PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
                 # Progress bars must stay off: a tqdm bar is one giant
                 # CR-delimited "line", and gbserver's log tailer bkills the job
                 # once a line exceeds 64 KiB. The wrapper defaults this too; set
                 # here as well so it is visible in build_describe.
                 TQDM_DISABLE: "1"
-                SR_CONFIG: "gb/sr-train-config-4.2-3b.yaml"
+                SR_CONFIG: "gb/sr-train-config-4.2-8b.yaml"
                 # A ref NAME, not a SHA: the wrapper uses `git clone --branch`,
                 # which cannot take a raw commit id. This tag is the fork's main
                 # immediately after the 2026-09-28 upstream sync.
                 INTRINSICS_REF: "sr-run-2026-09-28"
-                EVAL_BATCH_SIZE: "4"
+                # 2, not the 3b recipe's 4 -- what the prior successful 8b run used.
+                EVAL_BATCH_SIZE: "2"

@@ -13,7 +13,7 @@
 #
 # Env knobs (all optional):
 #   SR_CONFIG         SR training YAML, absolute or relative to $REPO_ROOT.
-#                     Default: gb/sr-train-config-4.2-3b.yaml
+#                     Default: gb/sr-train-config-4.2-8b.yaml
 #   INTRINSICS_REF    branch/tag/SHA of intrinsics_training. MUST be a ref NAME --
 #                     `git clone --branch` cannot take a raw SHA. Default: the
 #                     sr-run-2026-09-28 tag.
@@ -175,7 +175,7 @@ if [ "$EVAL_ONLY" != "1" ]; then
 
   # Resolve the SR training config once: both the data prep (for its max_length)
   # and training below read it, and they must not disagree.
-  SR_CONFIG_REL="${SR_CONFIG:-gb/sr-train-config-4.2-3b.yaml}"
+  SR_CONFIG_REL="${SR_CONFIG:-gb/sr-train-config-4.2-8b.yaml}"
   case "$SR_CONFIG_REL" in
     /*) CFG_FOR_PREP="$SR_CONFIG_REL" ;;
     *)  CFG_FOR_PREP="$REPO_ROOT/$SR_CONFIG_REL" ;;

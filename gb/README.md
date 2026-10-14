@@ -1,14 +1,16 @@
-# Answerability Shadow Residual adapter on granite-4.2-3b — granite.build recipe
+# Answerability Shadow Residual adapter on granite-4.2-8b — granite.build recipe
 
 Everything needed to train a **Shadow Residual (SR) adapter for the answerability
 intrinsic** on BlueVela GPUs lives in this directory. Nothing outside `gb/` was
 added or modified: the recipe is purely additive to the repo.
 
-- **Base model:** `ibm-granite/granite-4.2-3b`
+- **Base model:** `ibm-granite/granite-4.2-8b`
 - **Adapter:** SR — `cross_stream` + shared base-only K/V, always-active plain
   LoRA (stock `peft`, no gating), r16 / alpha 32
-- **Result:** accuracy **0.9152**, answerable F1 0.9119, unanswerable F1 0.9186
-  on the 3,565-example eval set — see [Results](#results)
+- **Result:** not yet run at 8b on this pipeline — see [Results](#results) for
+  the prior 8b reference and the 3b figure from the sibling branch
+- **Sibling branch:** [`gb/sr-ans-4.2-3b`](#related-branches) is the same recipe
+  at 3b, where it scored accuracy 0.9152
 
 ## Why this exists
 
@@ -33,8 +35,8 @@ does.
 
 | File | Role |
 |---|---|
-| `sr-answerability-4.2-3b.yaml` | **granite.build build YAML.** The thing you submit. Compute sizing, secrets, the BYOC config. Never read by the running job — `build_start` takes it from local disk. |
-| `sr-train-config-4.2-3b.yaml` | **SR training config.** Hyperparameters + data contract, consumed by `shadow_residual.training.train` via `--config`. Selected by the `SR_CONFIG` env var. |
+| `sr-answerability-4.2-8b.yaml` | **granite.build build YAML.** The thing you submit. Compute sizing, secrets, the BYOC config. Never read by the running job — `build_start` takes it from local disk. |
+| `sr-train-config-4.2-8b.yaml` | **SR training config.** Hyperparameters + data contract, consumed by `shadow_residual.training.train` via `--config`. Selected by the `SR_CONFIG` env var. |
 | `byoc_run.sh` | **Job entrypoint** (`start_command`). Four phases: fetch data → convert → train → eval. Carries the platform workarounds (see [Traps](#traps-encoded-in-byoc_runsh)). |
 | `prepare_answerability_jsonl.py` | Converts the intrinsics raw shards to SR messages-JSONL. Imports *their* transform module rather than reimplementing it. |
 | `probe_tokenizer.py` | Diagnostic: dumps special tokens + chat template so marker choices can be checked against the real tokenizer. Non-fatal. |
@@ -42,9 +44,16 @@ does.
 | `requirements-byoc.txt` | pip pins (`setup_command`). Mirrors `pyproject.toml` but pins torch to an explicit CUDA build. |
 
 Two files share a near-identical name on purpose, so read carefully:
-`sr-answerability-4.2-3b.yaml` is the **build** YAML (submitted to granite.build);
-`sr-train-config-4.2-3b.yaml` is the **training** config (consumed by the
+`sr-answerability-4.2-8b.yaml` is the **build** YAML (submitted to granite.build);
+`sr-train-config-4.2-8b.yaml` is the **training** config (consumed by the
 trainer). They were in different directories before this layout.
+
+**Only those two files are 8b-specific.** The other six are byte-identical to the
+3b branch — the model id is read out of the training config at runtime, so
+`prepare_answerability_jsonl.py`, `probe_tokenizer.py`, `environment.yml` and
+`requirements-byoc.txt` never mention a model, and `byoc_run.sh` differs only in
+which config it defaults to (the build YAML overrides that anyway). See
+[Keeping the branches in step](#keeping-the-branches-in-step).
 
 ## How to run it
 
@@ -54,10 +63,10 @@ trainer). They were in different directories before this layout.
 git rev-parse HEAD
 
 # 2. Validate (free, local). The flag is --filename, NOT --file.
-gb build validate --filename gb/sr-answerability-4.2-3b.yaml --space public --skip-version-check
+gb build validate --filename gb/sr-answerability-4.2-8b.yaml --space public --skip-version-check
 
 # 3. Submit.
-gb build start --filename gb/sr-answerability-4.2-3b.yaml --space public --skip-version-check
+gb build start --filename gb/sr-answerability-4.2-8b.yaml --space public --skip-version-check
 ```
 
 Dashboard: `https://api.llm-build-dev.vpc-int.res.ibm.com/dashboard/build/<BUILD_ID>`
@@ -80,26 +89,32 @@ neither bites.
 
 ### What it costs
 
-All measured, not estimated:
+Measured where measured, and labelled where not:
 
-| Phase | Time | Measured on |
+| Phase | Time | Source |
 |---|---|---|
-| Cold conda env: repo clone + `conda env create` + full pip install | **~5 min** | `f8bfeb40` — job start 23:36:14 → first training step 23:41:15, and that 5 min also covered the intrinsics clone, LFS pull, data prep and model load |
-| Setup on the full dataset (warm env) | **31 min** | `0f7a356d` — dominated by the over-length filter tokenizing all 14.3k rows before training starts |
-| Train + eval, 3 epochs, 1 GPU | **5h12m** | `0f7a356d` |
-| End to end | **5h47m** | `0f7a356d` |
+| Cold conda env: repo clone + `conda env create` + full pip install | **~5 min** | measured, `f8bfeb40` — job start 23:36:14 → first training step 23:41:15, and that 5 min also covered the intrinsics clone, LFS pull, data prep and model load |
+| Setup on the full dataset (warm env) | **31 min** | measured, 3b build `0f7a356d` — dominated by the over-length filter tokenizing all 14.3k rows. Model-independent apart from the model download, so it should hold here |
+| Train + eval, 3 epochs, 1 GPU | **~11-14 h** | *estimate.* The prior 8b run `88e44a92` did 11h02m end to end on 1 GPU — but at `max_length` 4096, so 8192 should cost more. The same recipe at 3b took 5h12m |
+| End to end | **~11-14 h** | as above; 3b was 5h47m |
 
-So budget ~6 h, and note the **setup cost is the tokenizing pass, not the conda
-env**. A cold env is single-digit minutes here — if you see "~50 minutes" quoted
-for a BYOC env build, it does not match this workload. Peak host RAM was 8.6 GB
-of the 128 Gi requested.
+The **setup cost is the tokenizing pass, not the conda env**. A cold env is
+single-digit minutes here — if you see "~50 minutes" quoted for a BYOC env build,
+it does not match this workload. Host RAM is not the constraint: the 3b run peaked
+at 8.6 GB, and 200Gi is requested here purely as headroom.
+
+Fill the estimates in with real numbers once this branch has a completed run.
 
 ## What this recipe does differently from upstream
 
 Hyperparameters are ported verbatim from intrinsics'
-`configs/answerability/shadow_residual/sr_sharedkv_4.2_3b.yaml`: r16 / alpha 32 /
+`configs/answerability/shadow_residual/sr_sharedkv_4.2_8b.yaml` — which, for
+answerability, is the **only** SR config that repo ships; there is no 3b sibling,
+unlike citations, hallucination detection, query clarification and query rewrite.
+So this branch runs the upstream recipe at its native size, and the 3b branch is
+that same recipe with the base model swapped down. The values: r16 / alpha 32 /
 dropout 0.05 / lr 5e-5 / 3 epochs / batch 1 × grad-accum 8 / max_length 8192 /
-seed 0. Four things had to change.
+seed 0. Five things had to change.
 
 1. **`adapter.invocation_tokens` removed.** SR is always-active plain LoRA now;
    the config schema is `extra="forbid"` and rejects the key outright.
@@ -110,6 +125,9 @@ seed 0. Four things had to change.
    dual-stream decoder forward is pure, so HF's non-reentrant recompute is exact.
 4. **The supervised-region boundary moved by three tokens.** This is the one
    change that alters what the model is trained on, so it is spelled out below.
+5. **`max_length` kept at 8192** — see below. Upstream says 8192; the earlier GHE
+   fork's 8b config cut it to 4096, and that is the one place this branch
+   deliberately disagrees with the thing that last ran successfully at 8b.
 
 ### The boundary change — read this before comparing F1 to older runs
 
@@ -134,14 +152,46 @@ published intrinsics adapter records `alora_invocation_tokens [100256, 78191,
 inside the supervised region, training the model to emit three tokens the prompt
 always supplies.
 
-Consequence: the historical 3b figure of **0.914 accuracy was measured under the
-old anchoring**, so 0.9152 here is **not** a controlled comparison. Treat it as
-"reproduces the baseline", not "beats it" — the gap is far inside the 0.0854
-sampling std.
+Consequence: any published 8b answerability figure was measured under the **old**
+anchoring, so whatever this run scores is **not** a controlled comparison against
+it. The same caveat applied at 3b, where this pipeline scored 0.9152 against a
+0.914 historical reference — a gap far inside the 0.0854 sampling std.
 
-Verified against the real tokenizer rather than assumed: `</think>` is a single
-token (100275), `<|im_end|>` is 100257, and the in-job check logged
-`last_context_token boundary validated on 8/8 sampled rows`.
+Verified against the real tokenizer rather than assumed: for
+`ibm-granite/granite-4.2-8b`, `</think>` is a single token (100275) and
+`<|im_end|>` is 100257 — **identical ids to 4.2-3b**, so the markers carry over
+unchanged. At 3b the in-job check logged `last_context_token boundary validated on
+8/8 sampled rows`; expect the same line here.
+
+### Why `max_length` stays 8192
+
+This is the only substantive disagreement with the prior successful 8b run, so
+here is the evidence. Measured on 3,000 real transformed rows with the
+granite-4.2-8b tokenizer, through `load_jsonl_dataset` — the same call the trainer
+makes:
+
+| | train | val |
+|---|---|---|
+| p50 / p90 / p99 | 779 / 7,332 / 14,926 | 776 / 6,706 / 13,818 |
+| max | 19,568 | 17,674 |
+| dropped at 8192 | 8.2% | 6.0% |
+| dropped at 6144 | 14.4% | 14.3% |
+| dropped at 4096 | **18.9%** | **18.3%** |
+
+Because answerability's label is the **last** thing in the sequence, a row over
+`max_length` is not merely truncated — it loses its completion, so
+`prepare_answerability_jsonl.py` drops it. `max_length` is therefore a direct
+data-retention knob, and 4096 costs more than twice the data 8192 does.
+
+The GHE fork's 8b config justified 4096 with "the answerability rows are well
+under this length". They are not: p90 is 7,332 tokens. 8192 also keeps the
+training set comparable to the 3b run (8.1% dropped there), which is what makes
+the two branches' numbers worth putting side by side.
+
+The risk this takes on is GPU memory, since activation cost grows with sequence
+length and the model is 2.6× larger. Gradient checkpointing is on, batch is 1, and
+`expandable_segments:True` is set. If it still OOMs it will do so within the first
+minutes of training, not hours in — drop to 6144 and record the new drop rate.
 
 ### Document placement
 
@@ -190,7 +240,7 @@ bash -n gb/byoc_run.sh
 #    ${VAR}s the wrapper exports. A schema rejection here costs a queue wait.
 PYTHONPATH=src DATA_ROOT=/tmp/d RUN_DIR=/tmp/r EVAL_DATA=/tmp/d/val.jsonl \
   python -c "from shadow_residual.config.training_config import load_training_config as L; \
-             c=L('gb/sr-train-config-4.2-3b.yaml'); \
+             c=L('gb/sr-train-config-4.2-8b.yaml'); \
              assert 'cross_stream' in c.adapter.target_modules; \
              assert not {'k_proj','v_proj'} & set(c.adapter.target_modules); print('ok')"
 
@@ -199,10 +249,10 @@ PYTHONPATH=src DATA_ROOT=/tmp/d RUN_DIR=/tmp/r EVAL_DATA=/tmp/d/val.jsonl \
 #    reports ("transform produced 14277 rows") is the real one.
 PYTHONPATH=src python gb/prepare_answerability_jsonl.py \
   --intrinsics-repo ~/intrinsics_training --out-dir /tmp/preptest \
-  --sr-config gb/sr-train-config-4.2-3b.yaml --subsample 300
+  --sr-config gb/sr-train-config-4.2-8b.yaml --subsample 300
 
 # 4. The build YAML validates. The flag is --filename, NOT --file.
-gb build validate --filename gb/sr-answerability-4.2-3b.yaml --space public --skip-version-check
+gb build validate --filename gb/sr-answerability-4.2-8b.yaml --space public --skip-version-check
 ```
 
 Step 3 is the one worth insisting on: it exercises the import-by-path into
@@ -215,66 +265,80 @@ running if you change something under `src/`.
 
 ## Results
 
-Full run — build **`0f7a356d-db43-4e86-b7eb-0ccb90d2be68`**, code at `07ed601`
-(pre-restructure layout), 1 GPU, 2026-10-14.
+**Not yet run at 8b on this pipeline.** This section is a placeholder with the
+numbers to check against; fill it in from the first completed build.
 
-| | |
-|---|---|
-| Rows | 14,277 transformed → 12,849 / 1,428 split → **11,812 train / 1,335 val** after dropping over-length |
-| Over-length dropped | 1,037 / 12,849 train (8.1%), 93 / 1,428 val (6.5%) |
-| Steps | 1,477 per epoch × 3 = **4,431** |
-| Trainable | `30,474,240 || all 3,952,355,840 || 0.7710%` |
-| Wall clock | ~5h43m train + eval |
+What to expect, and why each number is a check rather than a formality:
 
-| Metric | Value |
-|---|---|
-| answerability_f1 | 0.9119 |
-| unanswerability_f1 | 0.9186 |
-| **accuracy** | **0.9152** |
-| weighted_f1 | 0.9155 |
-| mean_f1 | 0.9152 |
-| accuracy_std | 0.0854 |
-| accuracy_ci_95 | 0.7478 – 1.0825 |
+| Signal | Expected | What a mismatch means |
+|---|---|---|
+| Rows | `transform produced 14277 rows` → 12,849 / 1,428 split → ~11.8k train / ~1.3k val after the over-length drop | A different transform count means the data or the intrinsics ref moved |
+| Over-length dropped | ~8.2% train, ~6.0% val at `max_length` 8192 | A much larger figure means `max_length` is not what this config says |
+| Steps | ~1,480 per epoch × 3 = ~4,430 | Far fewer means the batch arithmetic or a row cap is wrong |
+| Trainable params | the log prints `trainable params: … || all … || trainable%:`. At 3b it was `30,474,240 \|\| 3,952,355,840 \|\| 0.7710%`; expect a larger absolute count here at a similar order of percentage | A tiny count means `cross_stream`/MLP targets did not attach |
+| Loss | starts ~6.4 with token-acc ~0.45, falls below 0.05 with token-acc >0.99 | A flat loss means the supervised region is masked wrong |
+| Boundary check | `last_context_token boundary validated on N/N sampled rows` | Anything else means the marker and the template disagree |
+| `adapter_config.json` | `r: 16`, `lora_alpha: 32`, `target_modules` includes `cross_stream`, **`alora_invocation_tokens: null`** | A non-null value means an old gated SR got installed |
+| Eval | `eval_summary.jsonl` with answerable/unanswerable F1 | — |
 
-Historical 3b reference: accuracy 0.914 (answerable F1 0.910, unanswerable F1
-0.918) — but measured under the old boundary anchoring, so see the caveat above.
+Reference points to compare against, both measured under the **old** boundary
+anchoring (see the caveat above), so neither is a controlled comparison:
 
-The eval report header says **"granite-4.2-3b + aLoRA"**. That is a cosmetic bug
-in `answerability_eval.py` (line ~723 hardcodes `+ " + aLoRA"` in `--mode peft`).
-This adapter is **not** aLoRA; its `adapter_config.json` has
+| Run | Model | Result |
+|---|---|---|
+| This pipeline, 3b (`0f7a356d`, sibling branch) | granite-4.2-3b | accuracy **0.9152**, answerable F1 0.9119, unanswerable F1 0.9186, accuracy_std 0.0854 — the only figure produced by *this* boundary anchoring |
+| `88e44a92`, 2026-08-20 | granite-4.2-8b | SUCCESS at `max_length` 4096, 11h02m, 1 GPU / 200Gi, old SR code and old anchoring |
+| Historical intrinsics 3b | granite-4.2-3b | accuracy 0.914 (answerable F1 0.910, unanswerable F1 0.918) |
+
+Note the eval report header will say **"granite-4.2-8b + aLoRA"**. That is a
+cosmetic bug in `answerability_eval.py` (line ~723 hardcodes `+ " + aLoRA"` in
+`--mode peft`). This adapter is **not** aLoRA; its `adapter_config.json` has
 `alora_invocation_tokens: null`.
 
-### Where the adapter is
+### Where the adapter will be
 
-The lakehouse push failed (below), so the artifact lives on `/proj` only:
+There is no `outputs:` block, so the artifact stays in the build workspace on
+`/proj`. After the run, find it with:
 
 ```bash
-RUN=/proj/data-eng/llmb-read-write/builds/llm-build-0f7a356d-db43-4e86-b7eb-0ccb90d2be68/target-train/target-run-aa38e155-da47-433c-9fde-7a7892ad0cdf/step-custom_code_lsf/step-run-fc18b438-64c4-4980-afcc-ff53e5fa16af/launch-aa8ace64-48b3-48f5-bb11-dd6aab79f871/outputs
+# the step's outputs dir, under:
+#   /proj/data-eng/llmb-read-write/builds/llm-build-<BUILD_ID>/target-train/
+#     target-run-<...>/step-custom_code_lsf/step-run-<...>/launch-<...>/outputs
+build_files_list(build_id, recursive=True, pattern="outputs/checkpoints$", regex=True)
 
-ls $RUN/checkpoints   # adapter_config.json, adapter_model.safetensors (116 MB),
-                      # tokenizer files, checkpoint-{1477,2954,4431}, runs/
+ls $RUN/checkpoints   # adapter_config.json, adapter_model.safetensors,
+                      # tokenizer files, checkpoint-{N,2N,3N}, runs/
 ls $RUN/eval          # eval_summary.{md,jsonl,csv}, result_df.csv (all 3,565 predictions)
 ls $RUN/data          # train.jsonl / val.jsonl exactly as trained on
 ```
 
+For scale, the 3b adapter's `adapter_model.safetensors` was 116 MB; expect larger
+here.
+
 The root `checkpoints/` adapter is the `load_best_model_at_end` pick by
 `eval_loss` — not necessarily epoch 3. All three epoch checkpoints survive, so
 any can be re-scored without retraining via `EVAL_ONLY=1
-ADAPTER_PATH=$RUN/checkpoints/checkpoint-2954`.
+ADAPTER_PATH=$RUN/checkpoints/checkpoint-<step>`.
 
 To load it:
 
 ```python
 from shadow_residual.shadow_residual.build import build_sr_base
 from peft import PeftModel
-base = build_sr_base("ibm-granite/granite-4.2-3b", torch_dtype=...)
+base = build_sr_base("ibm-granite/granite-4.2-8b", torch_dtype=...)
 model = PeftModel.from_pretrained(base, f"{RUN}/checkpoints")
 ```
 
 Note this path is under the build workspace. If the adapter matters long-term,
-re-run the lakehouse push rather than relying on that location.
+publish it (restore the `outputs:` block in the build YAML) rather than relying on
+that location.
 
 ## What worked, what failed
+
+Everything below was established on the **3b** branch unless it says otherwise.
+It is carried over here because every one of these facts is model-independent —
+the clone, the data fetch, the env, the platform traps. The 8b-specific unknowns
+are listed at the end of this section.
 
 **Worked first time.** Cloning this repo from **public github.com** on a BlueVela
 compute node. This was the one genuinely unverified assumption — the step's
@@ -294,6 +358,8 @@ env hash `byoc-7e6d7089b9225fcd` and started in seconds.
 | `f8bfeb40` | **SUCCESS** | 20-step pipeline check during development. Proved github.com clone, LFS, config load, training, eval. Its YAML lives on `gb/sr-4.2-smoke-test`. |
 | `5cc97f9c` | FAILED in data prep | `KeyError: 'Environment variable ${DATA_ROOT} is not set'`. The over-length filter called `load_training_config()`, which eagerly resolves every `${VAR}` — including output paths the prep step neither has nor needs. Fixed by reading the YAML with `yaml.safe_load` for the four scalar fields it actually wants. |
 | `0f7a356d` | train+eval **success**, build **failed** | The `lhpush` step died on `401 Token is expired!` from `dmf fileset push`. A platform credential issue, downstream of all the real work — the adapter and metrics are intact. A FAILED build can contain a fully successful run. |
+| `fb991c9d` | 3b, on the `gb/` layout | Same recipe from the consolidated `gb/` directory, no `outputs:` block. |
+| `88e44a92` | **SUCCESS**, 8b | 2026-08-20, the last 8b answerability SR run: 11h02m, 1 GPU / 200Gi, `EVAL_BATCH_SIZE` 2. Old SR code (gated aLoRA), old boundary anchoring, `max_length` 4096. The compute sizing on this branch comes from it. |
 
 Two defects were found by verification rather than by a run blowing up, and both
 would have silently degraded results:
@@ -313,6 +379,22 @@ without re-testing the changed path. The smoke build could not have caught it �
 it ran the pre-fix commit. Re-validate the path you just changed, even when the
 change looks small. The failure was cheap only because data prep runs in the
 first minutes of the job.
+
+### What is still unknown at 8b
+
+Three things this branch has not yet demonstrated. All three fail early and
+cheaply if they fail at all:
+
+1. **Whether 8B at `max_length` 8192 fits one GPU.** The only successful 8b run
+   used 4096. Gradient checkpointing is on and batch is 1; an OOM would surface in
+   the first minutes of training. Fallback: 6144, then 4096, recording the new
+   drop rate each time.
+2. **Whether bf16 is stable at 8B.** The schema docstring recommends fp32 master
+   weights at this scale, but that advice targets FSDP, and `88e44a92` trained in
+   bf16 single-GPU. `validation.stop_on_nan` is on, so a divergence stops the run
+   at epoch end rather than burning 11 h.
+3. **Eval throughput at 8b.** `EVAL_BATCH_SIZE` is 2, copied from `88e44a92`. The
+   3b eval ran 3,565 examples at 3.7/s in ~16 min; expect materially slower.
 
 ### Debugging a failure
 
@@ -334,20 +416,51 @@ orchestrator is alive; the LSF job can still be `PEND`. Confirm with
 
 ## Related branches
 
+- **`gb/sr-ans-4.2-3b`** — the same recipe at granite-4.2-3b, and the branch this
+  one was cut from. It holds the only results produced under the current boundary
+  anchoring (accuracy 0.9152) and the measured timings this branch's estimates
+  lean on.
 - **`gb/sr-4.2-smoke-test`** — the development history: the pre-restructure
   layout where these files sat in `scripts/` and `src/shadow_residual/config/`,
   plus `sr-answerability-4.2-3b-smoke.yaml`, the 20-step pipeline-check build.
   Neither that YAML nor any smoke knob is carried over here — this branch runs the
   full recipe only. Build `0f7a356d`'s code (`07ed601`) is on that branch.
 
+### Keeping the branches in step
+
+Six of the eight files here are byte-identical to `gb/sr-ans-4.2-3b`, so a fix to
+any of them has to be applied twice. Check with:
+
+```bash
+git diff gb/sr-ans-4.2-3b gb/sr-ans-4.2-8b -- \
+  gb/prepare_answerability_jsonl.py gb/probe_tokenizer.py \
+  gb/environment.yml gb/requirements-byoc.txt
+# expect: no output
+
+git diff gb/sr-ans-4.2-3b gb/sr-ans-4.2-8b -- gb/byoc_run.sh
+# expect: only the default SR_CONFIG path (2 lines)
+```
+
+This duplication is the deliberate cost of one branch per model size. The
+alternative is a single branch carrying both training configs and both build
+YAMLs — `SR_CONFIG` already selects between them at submit time, so the
+entrypoint needs no change for it.
+
 ## Known rough edges
 
-- `sr-train-config-4.2-3b.yaml` lives here rather than in
+- `sr-train-config-4.2-8b.yaml` lives here rather than in
   `src/shadow_residual/config/` with the six other training configs. It is
   therefore **not** installed as package data (`pyproject.toml` ships only
   `config/*.yaml`), so a `pip install` of this repo will not carry it. Its
   `$schema` comment points back into the package by relative path.
 - The eval report mislabels every `--mode peft` adapter as "+ aLoRA".
+- **1 GPU only for now.** `byoc_run.sh` switches to `accelerate launch` with the
+  bundled FSDP config when `LLMB_LSF_NUM_GPUS > 1`, and the only config shipped is
+  `fsdp_4gpu.yaml`, so the supported values are 1 or 4. **That path has never been
+  exercised by any of these builds** — every success, 3b and 8b, was single-GPU —
+  so 4 GPUs is a deliberate next iteration rather than a config tweak. When trying
+  it, also set `param_dtype: fp32` in the training config: under FSDP, bf16
+  force-casts adapters down to satisfy flatten.
 - There is **no `outputs:` lakehouse block** in the build YAML on this branch.
   That block is what appends the `lhpush` step, and hence the possibility of a red
   build from an otherwise perfect run — which is exactly what happened to
