@@ -1,0 +1,51 @@
+# Python deps for the granite.build BYOC runs (gb/*.yaml).
+#
+# These mirror this project's pyproject.toml pins, with torch pinned to an
+# explicit CUDA build. pyproject declares `torch>=2.4` unpinned, which would
+# resolve to whatever the newest wheel is and may not match the cluster driver;
+# cu124 / 2.6.0 is the combination the prior BlueVela runs used successfully.
+#
+# We deliberately do NOT `pip install .`:
+#   - this repo is src-layout with no reason to install, and the step already
+#     prepends $REPO_ROOT to $PYTHONPATH (the wrapper adds $REPO_ROOT/src);
+#   - editable installs pin the env to a per-job repo path and break env-cache
+#     reuse, which the step's validator warns about.
+#
+# This file is part of the BYOC conda-env cache key: editing it forces a
+# one-time full env rebuild (~50 min) on the next build. Batch dependency
+# changes rather than paying that repeatedly, and never launch two builds
+# concurrently while a new env is being created -- they share CONDA_PKGS_DIRS
+# and have been observed corrupting each other.
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0
+
+# Upper bound is load-bearing: transformers >=5.10 renamed/strict-validated
+# GraniteMoeHybridConfig layer_types ("attention" -> "full_attention"), which
+# build_sr_config's normalization depends on.
+transformers>=5.5.1,<5.10.0
+peft==0.19.1
+trl>=1.0,<1.7          # TRL 1.7 reads config.num_experts and crashes on Granite configs
+datasets>=2.14
+accelerate>=0.20
+pydantic>=2.0
+pyyaml
+safetensors
+
+# HF's WandbCallback is constructed unconditionally when wandb is importable;
+# WANDB_MODE=disabled (set in the build YAML) makes it a no-op. Present so the
+# callback import cannot fail.
+wandb
+
+# runtime.report_to in the SR config includes tensorboard.
+tensorboard
+
+# datasets -> pyarrow is transitive, but intrinsics_training's transform module
+# imports pyarrow directly at module scope.
+pyarrow
+
+# shadow_residual.eval.answerability_eval imports numpy and pandas at module
+# scope. Both arrive transitively via datasets, but nothing pins them.
+numpy
+pandas

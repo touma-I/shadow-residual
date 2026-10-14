@@ -1,0 +1,20 @@
+# Conda env for the granite.build BYOC runs (gb/*.yaml).
+#
+# Deliberately minimal: the BYOC step builds this env on a shared NFS package
+# cache, and every extra conda package widens the window for the concurrent-build
+# corruption that cache is prone to. Python deps go in requirements-byoc.txt
+# instead, installed via the recipe's setup_command.
+#
+# git-lfs is NOT optional. gb/byoc_run.sh clones intrinsics_training to get
+# the answerability training data, which is Git-LFS-tracked; without git-lfs the
+# raw shards arrive as ~131-byte pointer files and the run would train on nothing.
+#
+# python=3.12 is inside this project's requires-python (>=3.10,<3.14).
+name: shadow-residual-byoc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git
+  - git-lfs
