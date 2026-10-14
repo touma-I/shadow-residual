@@ -5,10 +5,18 @@
 ### Type:      Shadow Residual (cross_stream + shared base-only K/V, always-active
 ###            plain LoRA -- no gating)
 ###
-### Runs the full recipe: 3 epochs over the 40k-row subsample (~12.8k train /
-### ~1.4k val after the 0.1 split), effective batch 8, ~4,800 optimizer steps.
-### Budget ~9h40m on 1 GPU based on the prior successful 3b run, which peaked at
-### 8.6 GB host RAM of the 128 Gi requested.
+### Runs the full recipe: 3 epochs, effective batch 8. The raw shards yield
+### ~14.3k rows, which is under the 40k subsample cap, so the subsample is a
+### no-op; the 0.1 split gives ~12.8k train / ~1.4k val, and dropping rows over
+### max_length (measured at 8.0% / 7.0%) leaves ~11.8k / ~1.3k. That is ~1,480
+### steps per epoch, ~4,430 total.
+###
+### Budget at least ~9h40m on 1 GPU -- that is what the prior successful 3b run
+### took, and it peaked at only 8.6 GB host RAM of the 128 Gi requested. Expect
+### somewhat longer here: that run had gradient checkpointing effectively off
+### (invocation_tokens forced it off), whereas this config enables it, trading
+### wall-clock for activation memory. Long runs are not a problem on this queue
+### -- a 3b 10-epoch run has completed at 24h35m and an 8b at ~35h.
 ###
 ### Run gb/sr-answerability-4.2-3b-smoke.yaml FIRST. It shares this file's
 ### environment.yml + requirements-byoc.txt + setup_command, so it warms the
@@ -73,7 +81,8 @@ granite.build:
               # config schema accepts any host.tld/path. What this run proves is
               # that the compute node has egress to github.com at all.
               github_url: "github.com/touma-I/shadow-residual"
-              github_ref: "REPLACE_WITH_COMMIT_SHA"
+              # Pinned to the commit this run actually cloned; build 5cc97f9c.
+              github_ref: "695e249fb82bc11dd5c47506be602307f70af426"
               conda_lockfile_path: "environment.yml"
               # The leading `ls` is a fail-fast guard: it runs in seconds during
               # phase 3, before the ~50-minute conda env build, so a clone that

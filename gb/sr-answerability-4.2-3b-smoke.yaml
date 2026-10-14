@@ -66,7 +66,8 @@ granite.build:
               # config schema accepts any host.tld/path. What this run proves is
               # that the compute node has egress to github.com at all.
               github_url: "github.com/touma-I/shadow-residual"
-              github_ref: "REPLACE_WITH_COMMIT_SHA"
+              # Pinned to the commit this run actually cloned; build f8bfeb40 (SUCCESS).
+              github_ref: "c283b90bca9791d4cf0e65d9ffe5af32686acee2"
               conda_lockfile_path: "environment.yml"
               # The leading `ls` is a fail-fast guard: it runs in seconds during
               # phase 3, before the ~50-minute conda env build, so a clone that
