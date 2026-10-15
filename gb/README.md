@@ -7,8 +7,10 @@ added or modified: the recipe is purely additive to the repo.
 - **Base model:** `ibm-granite/granite-4.2-3b`
 - **Adapter:** SR — `cross_stream` + shared base-only K/V, always-active plain
   LoRA (stock `peft`, no gating), r16 / alpha 32
-- **Result:** accuracy **0.9152**, answerable F1 0.9119, unanswerable F1 0.9186
-  on the 3,565-example eval set — see [Results](#results)
+- **Result:** accuracy **0.9132** on the 3,565-example eval set (`fb991c9d`, this
+  layout); 0.9152 on the pre-restructure run — see [Results](#results)
+- **Sibling branch:** [`gb/sr-ans-4.2-8b`](#related-branches) is the same recipe
+  at 8b, which scored **0.9116** — 2.6x the parameters for no measurable gain
 
 ## Why this exists
 
@@ -84,15 +86,18 @@ All measured, not estimated:
 
 | Phase | Time | Measured on |
 |---|---|---|
-| Cold conda env: repo clone + `conda env create` + full pip install | **~5 min** | `f8bfeb40` — job start 23:36:14 → first training step 23:41:15, and that 5 min also covered the intrinsics clone, LFS pull, data prep and model load |
-| Setup on the full dataset (warm env) | **31 min** | `0f7a356d` — dominated by the over-length filter tokenizing all 14.3k rows before training starts |
-| Train + eval, 3 epochs, 1 GPU | **5h12m** | `0f7a356d` |
-| End to end | **5h47m** | `0f7a356d` |
+| Everything before the first training step, **with a cold conda env**: repo clone + `conda env create` + full pip install + intrinsics clone + LFS pull + full data prep + model load | **23 min** | `fb991c9d` on this exact layout — step start 13:48:45, `cache: MISS`, first training step 14:11:46 |
+| Same, warm env | **31 min** | `0f7a356d`. Yes — *longer* than the cold-env run above, which is the point: the env is noise next to the tokenizing pass |
+| Training, 3 epochs, 1 GPU | **4h56m** | `fb991c9d` |
+| Eval, 3,565 examples at `EVAL_BATCH_SIZE` 4 | **15m** | `fb991c9d` |
+| End to end | **5h36m** | `fb991c9d` — 13:47:26 → 19:23:46 |
 
 So budget ~6 h, and note the **setup cost is the tokenizing pass, not the conda
-env**. A cold env is single-digit minutes here — if you see "~50 minutes" quoted
-for a BYOC env build, it does not match this workload. Peak host RAM was 8.6 GB
-of the 128 Gi requested.
+env**. A cold env alone measured ~5 min on `f8bfeb40`; if you see "~50 minutes"
+quoted for a BYOC env build, it does not match this workload. Peak host RAM was
+8.6 GB of the 128 Gi requested.
+
+The same recipe at 8b takes 7h25m — about 1.3x this, not 2x.
 
 ## What this recipe does differently from upstream
 
@@ -215,29 +220,46 @@ running if you change something under `src/`.
 
 ## Results
 
-Full run — build **`0f7a356d-db43-4e86-b7eb-0ccb90d2be68`**, code at `07ed601`
-(pre-restructure layout), 1 GPU, 2026-10-14.
+Full run — build **`fb991c9d-df11-493d-9b29-3c1fb16d1b92`**, code at `11f4669`
+(this `gb/` layout), 1 GPU, 2026-10-14. Build status **success**: with the
+`outputs:` block removed there is no `lhpush` step to go red.
 
 | | |
 |---|---|
-| Rows | 14,277 transformed → 12,849 / 1,428 split → **11,812 train / 1,335 val** after dropping over-length |
+| Rows | 14,277 transformed -> 12,849 / 1,428 split -> **11,812 train / 1,335 val** after dropping over-length |
 | Over-length dropped | 1,037 / 12,849 train (8.1%), 93 / 1,428 val (6.5%) |
-| Steps | 1,477 per epoch × 3 = **4,431** |
-| Trainable | `30,474,240 || all 3,952,355,840 || 0.7710%` |
-| Wall clock | ~5h43m train + eval |
+| Steps | 1,477 per epoch x 3 = **4,431** |
+| Trainable | `30,474,240 \|\| all 3,952,355,840 \|\| 0.7710%` |
+| Adapter | `adapter_model.safetensors` 116 MiB; all three epoch checkpoints kept |
+| Wall clock | 23m setup (cold env) -> 4h56m training -> 15m eval = **5h36m** |
 
-| Metric | Value |
-|---|---|
-| answerability_f1 | 0.9119 |
-| unanswerability_f1 | 0.9186 |
-| **accuracy** | **0.9152** |
-| weighted_f1 | 0.9155 |
-| mean_f1 | 0.9152 |
-| accuracy_std | 0.0854 |
-| accuracy_ci_95 | 0.7478 – 1.0825 |
+| Metric | `fb991c9d` (this layout) | `0f7a356d` (pre-restructure) |
+|---|---|---|
+| answerability_f1 | 0.9094 | 0.9119 |
+| unanswerability_f1 | 0.9170 | 0.9186 |
+| **accuracy** | **0.9132** | **0.9152** |
+| weighted_f1 | 0.9135 | 0.9155 |
+| mean_f1 | 0.9132 | 0.9152 |
+| accuracy_std | 0.0796 | 0.0854 |
+| accuracy_ci_95 | 0.7571 – 1.0693 | 0.7478 – 1.0825 |
 
-Historical 3b reference: accuracy 0.914 (answerable F1 0.910, unanswerable F1
-0.918) — but measured under the old boundary anchoring, so see the caveat above.
+**The two runs differ by 0.002 on identical code and data.** The restructure moved
+file paths only, and the log confirms the pipeline ran identically — same
+`dropped 1037/12849 rows (8.1%)`, same `trainable params: 30,474,240 || all params:
+3,952,355,840 || trainable%: 0.7710`, same 4,431 steps. So that 0.002 is GPU
+nondeterminism, and it sets the floor for reading any difference on this setup:
+**nothing below ~0.005 is a signal.**
+
+Reference points, both measured under the **old** boundary anchoring (see the
+caveat above), so neither is a controlled comparison:
+
+| Run | Model | Accuracy |
+|---|---|---|
+| Historical intrinsics reference | granite-4.2-3b | 0.914 |
+| `cccffe72` — same recipe, 8b (sibling branch) | granite-4.2-8b | 0.9116, current anchoring |
+
+The 8b result is the interesting one: **2.6x the parameters and 1.3x the wall
+clock buy nothing measurable.** This task appears to saturate around 0.91.
 
 The eval report header says **"granite-4.2-3b + aLoRA"**. That is a cosmetic bug
 in `answerability_eval.py` (line ~723 hardcodes `+ " + aLoRA"` in `--mode peft`).
@@ -246,15 +268,26 @@ This adapter is **not** aLoRA; its `adapter_config.json` has
 
 ### Where the adapter is
 
-The lakehouse push failed (below), so the artifact lives on `/proj` only:
+No `outputs:` block, so the artifact stays in the build workspace on `/proj`.
+From the green run on this layout:
 
 ```bash
-RUN=/proj/data-eng/llmb-read-write/builds/llm-build-0f7a356d-db43-4e86-b7eb-0ccb90d2be68/target-train/target-run-aa38e155-da47-433c-9fde-7a7892ad0cdf/step-custom_code_lsf/step-run-fc18b438-64c4-4980-afcc-ff53e5fa16af/launch-aa8ace64-48b3-48f5-bb11-dd6aab79f871/outputs
+RUN=/proj/data-eng/llmb-read-write/builds/llm-build-fb991c9d-df11-493d-9b29-3c1fb16d1b92/target-train/target-run-3ddb7f2c-956b-4cb4-827f-87562ce91b98/step-custom_code_lsf/step-run-026b1c9b-bd5e-4bd9-9cb6-a9babebfa80c/launch-ea3ac6ee-161b-47d9-a50f-8b98862aff7d/outputs
 
-ls $RUN/checkpoints   # adapter_config.json, adapter_model.safetensors (116 MB),
+ls $RUN/checkpoints   # adapter_config.json, adapter_model.safetensors (116 MiB),
                       # tokenizer files, checkpoint-{1477,2954,4431}, runs/
 ls $RUN/eval          # eval_summary.{md,jsonl,csv}, result_df.csv (all 3,565 predictions)
 ls $RUN/data          # train.jsonl / val.jsonl exactly as trained on
+```
+
+The earlier `0f7a356d` adapter is still on `/proj` too, under
+`llm-build-0f7a356d-db43-4e86-b7eb-0ccb90d2be68/...`, if the 0.9152 run is wanted
+specifically.
+
+For a future run, find the equivalent path with:
+
+```
+build_files_list(build_id, recursive=True, pattern="outputs/checkpoints$", regex=True)
 ```
 
 The root `checkpoints/` adapter is the `load_best_model_at_end` pick by
@@ -272,7 +305,8 @@ model = PeftModel.from_pretrained(base, f"{RUN}/checkpoints")
 ```
 
 Note this path is under the build workspace. If the adapter matters long-term,
-re-run the lakehouse push rather than relying on that location.
+publish it (restore the `outputs:` block in the build YAML) rather than relying on
+that location.
 
 ## What worked, what failed
 
@@ -294,6 +328,8 @@ env hash `byoc-7e6d7089b9225fcd` and started in seconds.
 | `f8bfeb40` | **SUCCESS** | 20-step pipeline check during development. Proved github.com clone, LFS, config load, training, eval. Its YAML lives on `gb/sr-4.2-smoke-test`. |
 | `5cc97f9c` | FAILED in data prep | `KeyError: 'Environment variable ${DATA_ROOT} is not set'`. The over-length filter called `load_training_config()`, which eagerly resolves every `${VAR}` — including output paths the prep step neither has nor needs. Fixed by reading the YAML with `yaml.safe_load` for the four scalar fields it actually wants. |
 | `0f7a356d` | train+eval **success**, build **failed** | The `lhpush` step died on `401 Token is expired!` from `dmf fileset push`. A platform credential issue, downstream of all the real work — the adapter and metrics are intact. A FAILED build can contain a fully successful run. |
+| `fb991c9d` | **SUCCESS** | This layout, `outputs:` removed. Validated every relocated path and reproduced `0f7a356d` to within 0.002 accuracy. Green end to end, 5h36m. |
+| `cccffe72` | **SUCCESS** | The same recipe at 8b on `gb/sr-ans-4.2-8b`: 0.9116, 7h25m. |
 
 Two defects were found by verification rather than by a run blowing up, and both
 would have silently degraded results:
@@ -333,6 +369,11 @@ orchestrator is alive; the LSF job can still be `PEND`. Confirm with
 `build_log(runner=True, grep="-o -m3 STAT='[A-Z]*'")`.
 
 ## Related branches
+
+- **`gb/sr-ans-4.2-8b`** — the same recipe at granite-4.2-8b, cut from this
+  branch. Six of its eight files are byte-identical to these, so a fix here needs
+  applying there too; that README documents the `git diff` check. Its run scored
+  0.9116, i.e. no gain over 3b.
 
 - **`gb/sr-4.2-smoke-test`** — the development history: the pre-restructure
   layout where these files sat in `scripts/` and `src/shadow_residual/config/`,
