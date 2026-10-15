@@ -7,10 +7,11 @@ added or modified: the recipe is purely additive to the repo.
 - **Base model:** `ibm-granite/granite-4.2-8b`
 - **Adapter:** SR — `cross_stream` + shared base-only K/V, always-active plain
   LoRA (stock `peft`, no gating), r16 / alpha 32
-- **Result:** not yet run at 8b on this pipeline — see [Results](#results) for
-  the prior 8b reference and the 3b figure from the sibling branch
+- **Result:** accuracy **0.9116**, answerable F1 0.9130, unanswerable F1 0.9165
+  on the 3,565-example eval set — see [Results](#results)
 - **Sibling branch:** [`gb/sr-ans-4.2-3b`](#related-branches) is the same recipe
-  at 3b, where it scored accuracy 0.9152
+  at 3b, which scored **0.9132** — i.e. 8b buys nothing here, see
+  [Results](#results)
 
 ## Why this exists
 
@@ -95,15 +96,24 @@ Measured where measured, and labelled where not:
 |---|---|---|
 | Everything before the first training step, **with a cold conda env**: repo clone + `conda env create` + full pip install + intrinsics clone + LFS pull + full data prep + model load | **23 min** | measured, 3b build `fb991c9d` on this exact layout — step start 13:48:45, `cache: MISS`, first training step 14:11:46. Dominated by the over-length filter tokenizing all 14.3k rows, not by the env (a cold env alone measured ~5 min on `f8bfeb40`) |
 | Same, warm env | **31 min** | measured, 3b build `0f7a356d`. Yes — *longer* than the cold-env run above, which is the point: the env is noise next to the tokenizing pass |
-| Train + eval, 3 epochs, 1 GPU | **~11-14 h** | *estimate.* The prior 8b run `88e44a92` did 11h02m end to end on 1 GPU — but at `max_length` 4096, so 8192 should cost more. The same recipe at 3b took 5h12m |
-| End to end | **~11-14 h** | as above; 3b was 5h47m |
+| Training, 3 epochs, 1 GPU | **6h30m** | measured, `cccffe72` — 17:00:52 → 23:31, i.e. ~2h09m per epoch |
+| Eval, 3,565 examples at `EVAL_BATCH_SIZE` 2 | **26m** | measured, `cccffe72` |
+| End to end | **7h25m** | measured, `cccffe72` — 16:33:45 → 23:58:18 |
+
+For comparison the same recipe at 3b took **5h36m** end to end (4h56m training,
+15m eval at `EVAL_BATCH_SIZE` 4). So 8b costs about 1.3x the wall clock of 3b,
+not the 2x the parameter count might suggest.
+
+**The ~11-14 h written here before the first run was an overestimate.** It was
+extrapolated from `88e44a92`'s 11h02m on the assumption that 8192 would cost more
+than that run's 4096; in fact this run beat it outright at twice the sequence
+length. Old builds are useful for *sizing* (GPUs, memory, eval batch) and poor for
+predicting wall clock.
 
 The **setup cost is the tokenizing pass, not the conda env**. A cold env is
 single-digit minutes here — if you see "~50 minutes" quoted for a BYOC env build,
 it does not match this workload. Host RAM is not the constraint: the 3b run peaked
 at 8.6 GB, and 200Gi is requested here purely as headroom.
-
-Fill the estimates in with real numbers once this branch has a completed run.
 
 ## What this recipe does differently from upstream
 
@@ -265,60 +275,94 @@ running if you change something under `src/`.
 
 ## Results
 
-**Not yet run at 8b on this pipeline.** This section is a placeholder with the
-numbers to check against; fill it in from the first completed build.
+Full run — build **`cccffe72-01cf-4e5d-b9b4-20e071db9c82`**, code at `f1eb74f`,
+1 GPU, 2026-10-14. Build status **success** (no `outputs:` block, so no `lhpush`
+step to fail).
 
-What to expect, and why each number is a check rather than a formality:
+| | |
+|---|---|
+| Rows | 14,277 transformed -> 12,849 / 1,428 split -> **11,812 train / 1,335 val** after dropping over-length |
+| Over-length dropped | 1,037 / 12,849 train (8.1%), 93 / 1,428 val (6.5%) — at `max_length` 8192 |
+| Steps | 1,477 per epoch x 3 = **4,431** |
+| Trainable | `48,168,960 \|\| all 9,510,850,560 \|\| 0.5065%` |
+| Adapter | `adapter_model.safetensors` 184 MiB; all three epoch checkpoints kept (1477 / 2954 / 4431) |
+| Wall clock | 26m setup -> 6h30m training -> 26m eval = **7h25m** |
 
-| Signal | Expected | What a mismatch means |
-|---|---|---|
-| Rows | `transform produced 14277 rows` → 12,849 / 1,428 split → ~11.8k train / ~1.3k val after the over-length drop | A different transform count means the data or the intrinsics ref moved |
-| Over-length dropped | ~8.2% train, ~6.0% val at `max_length` 8192 | A much larger figure means `max_length` is not what this config says |
-| Steps | ~1,480 per epoch × 3 = ~4,430 | Far fewer means the batch arithmetic or a row cap is wrong |
-| Trainable params | the log prints `trainable params: … || all … || trainable%:`. At 3b it was `30,474,240 \|\| 3,952,355,840 \|\| 0.7710%`; expect a larger absolute count here at a similar order of percentage | A tiny count means `cross_stream`/MLP targets did not attach |
-| Loss | starts ~6.4 with token-acc ~0.45, falls below 0.05 with token-acc >0.99 | A flat loss means the supervised region is masked wrong |
-| Boundary check | `last_context_token boundary validated on N/N sampled rows` | Anything else means the marker and the template disagree |
-| `adapter_config.json` | `r: 16`, `lora_alpha: 32`, `target_modules` includes `cross_stream`, **`alora_invocation_tokens: null`** | A non-null value means an old gated SR got installed |
-| Eval | `eval_summary.jsonl` with answerable/unanswerable F1 | — |
+| Metric | Value |
+|---|---|
+| answerability_precision | 0.9030 |
+| answerability_recall | 0.9232 |
+| answerability_f1 | 0.9130 |
+| unanswerability_precision | 0.9321 |
+| unanswerability_recall | 0.9015 |
+| unanswerability_f1 | 0.9165 |
+| **accuracy** | **0.9116** |
+| weighted_f1 | 0.9149 |
+| mean_f1 | 0.9148 |
+| accuracy_std | 0.0483 |
+| accuracy_ci_95 | 0.8169 – 1.0062 |
 
-Reference points to compare against, both measured under the **old** boundary
-anchoring (see the caveat above), so neither is a controlled comparison:
+### 8b does not beat 3b on this task
 
-| Run | Model | Result |
-|---|---|---|
-| This pipeline, 3b (`0f7a356d`, sibling branch) | granite-4.2-3b | accuracy **0.9152**, answerable F1 0.9119, unanswerable F1 0.9186, accuracy_std 0.0854 — the only figure produced by *this* boundary anchoring |
-| `88e44a92`, 2026-08-20 | granite-4.2-8b | SUCCESS at `max_length` 4096, 11h02m, 1 GPU / 200Gi, old SR code and old anchoring |
-| Historical intrinsics 3b | granite-4.2-3b | accuracy 0.914 (answerable F1 0.910, unanswerable F1 0.918) |
+| Run | Model | Accuracy | answerable F1 | unanswerable F1 | std |
+|---|---|---|---|---|---|
+| `cccffe72` (this branch) | granite-4.2-8b | **0.9116** | 0.9130 | 0.9165 | 0.0483 |
+| `fb991c9d` (3b branch, same `gb/` layout) | granite-4.2-3b | **0.9132** | 0.9094 | 0.9170 | 0.0796 |
+| `0f7a356d` (3b, pre-restructure layout) | granite-4.2-3b | 0.9152 | 0.9119 | 0.9186 | 0.0854 |
+| Historical intrinsics reference | granite-4.2-3b | 0.914 | 0.910 | 0.918 | — |
 
-Note the eval report header will say **"granite-4.2-8b + aLoRA"**. That is a
-cosmetic bug in `answerability_eval.py` (line ~723 hardcodes `+ " + aLoRA"` in
-`--mode peft`). This adapter is **not** aLoRA; its `adapter_config.json` has
-`alora_invocation_tokens: null`.
+All four land inside 0.004 of each other, against a sampling std of 0.048-0.085.
+The honest read is that **this task saturates at ~0.91 regardless of base model
+size**: 2.6x the parameters, 1.3x the wall clock, and no measurable gain. 8b's
+`accuracy_std` is lower (0.0483 vs 0.0796), which is the only difference that
+looks like it might be real, and even that is one run.
 
-### Where the adapter will be
+Two caveats before anyone treats this as a model comparison. The two 3b runs
+differ by 0.002 from each other on *identical code and data* — that is the
+run-to-run floor on this setup, so nothing below ~0.005 is a signal. And the prior
+8b run (`88e44a92`) used the old boundary anchoring and `max_length` 4096, so it
+is not comparable either.
+
+### Verification signals, all confirmed
+
+| Signal | Observed |
+|---|---|
+| Config loaded under `extra="forbid"` | yes — training started |
+| Boundary check | `last_context_token boundary validated on 8/8 sampled rows` |
+| `adapter_config.json` | `r: 16`, `lora_alpha: 32`, `rank_pattern` includes `cross_stream: 16`, no `k_proj`/`v_proj`, `last_context_token_id: 100275`, `last_token_id: 100257` |
+| **`alora_invocation_tokens`** | **`null`** — confirms current stock-PEFT SR, not the old gated design |
+| `base_model_name_or_path` | `ibm-granite/granite-4.2-8b` |
+| Exit codes | `train exit code: 0`, `eval exit code: 0` |
+
+The eval report header says **"granite-4.2-8b + aLoRA"**, exactly as predicted.
+That is the known cosmetic bug in `answerability_eval.py` (line ~723 hardcodes
+`+ " + aLoRA"` in `--mode peft`); the adapter is not aLoRA.
+
+### Where the adapter is
 
 There is no `outputs:` block, so the artifact stays in the build workspace on
-`/proj`. After the run, find it with:
+`/proj`:
 
 ```bash
-# the step's outputs dir, under:
-#   /proj/data-eng/llmb-read-write/builds/llm-build-<BUILD_ID>/target-train/
-#     target-run-<...>/step-custom_code_lsf/step-run-<...>/launch-<...>/outputs
-build_files_list(build_id, recursive=True, pattern="outputs/checkpoints$", regex=True)
+RUN=/proj/data-eng/llmb-read-write/builds/llm-build-cccffe72-01cf-4e5d-b9b4-20e071db9c82/target-train/target-run-a4f1d754-f112-4b97-88f6-dd345f2e9054/step-custom_code_lsf/step-run-4c898c9b-d072-4d81-bc0f-75cb8de4c259/launch-c89f5ed2-d4cf-4208-9b75-50d66f1fb9b5/outputs
 
-ls $RUN/checkpoints   # adapter_config.json, adapter_model.safetensors,
-                      # tokenizer files, checkpoint-{N,2N,3N}, runs/
+ls $RUN/checkpoints   # adapter_config.json, adapter_model.safetensors (184 MiB),
+                      # tokenizer files, chat_template.jinja,
+                      # checkpoint-{1477,2954,4431}, runs/
 ls $RUN/eval          # eval_summary.{md,jsonl,csv}, result_df.csv (all 3,565 predictions)
 ls $RUN/data          # train.jsonl / val.jsonl exactly as trained on
 ```
 
-For scale, the 3b adapter's `adapter_model.safetensors` was 116 MB; expect larger
-here.
+For a future run, find the equivalent path with:
+
+```
+build_files_list(build_id, recursive=True, pattern="outputs/checkpoints$", regex=True)
+```
 
 The root `checkpoints/` adapter is the `load_best_model_at_end` pick by
 `eval_loss` — not necessarily epoch 3. All three epoch checkpoints survive, so
 any can be re-scored without retraining via `EVAL_ONLY=1
-ADAPTER_PATH=$RUN/checkpoints/checkpoint-<step>`.
+ADAPTER_PATH=$RUN/checkpoints/checkpoint-2954`.
 
 To load it:
 
@@ -380,21 +424,22 @@ it ran the pre-fix commit. Re-validate the path you just changed, even when the
 change looks small. The failure was cheap only because data prep runs in the
 first minutes of the job.
 
-### What is still unknown at 8b
+### The 8b unknowns, resolved
 
-Three things this branch has not yet demonstrated. All three fail early and
-cheaply if they fail at all:
+All three open questions this branch started with were answered by the first run:
 
-1. **Whether 8B at `max_length` 8192 fits one GPU.** The only successful 8b run
-   used 4096. Gradient checkpointing is on and batch is 1; an OOM would surface in
-   the first minutes of training. Fallback: 6144, then 4096, recording the new
-   drop rate each time.
-2. **Whether bf16 is stable at 8B.** The schema docstring recommends fp32 master
-   weights at this scale, but that advice targets FSDP, and `88e44a92` trained in
-   bf16 single-GPU. `validation.stop_on_nan` is on, so a divergence stops the run
-   at epoch end rather than burning 11 h.
-3. **Eval throughput at 8b.** `EVAL_BATCH_SIZE` is 2, copied from `88e44a92`. The
-   3b eval ran 3,565 examples at 3.7/s in ~16 min; expect materially slower.
+1. **8B at `max_length` 8192 fits one GPU.** No OOM, no fallback to 6144 needed.
+   This was the risk taken on by refusing the prior run's 4096, and it paid off:
+   the training set stayed comparable to 3b's, at 8.2% of rows dropped instead of
+   18.9%.
+2. **bf16 is stable at 8B.** Loss converged normally and `stop_on_nan` never
+   fired, so the schema's fp32-master-weights advice really is FSDP-specific.
+   Revisit it when trying 4 GPUs.
+3. **Eval throughput.** 3,565 examples in 26m at `EVAL_BATCH_SIZE` 2, versus 15m
+   at batch 4 for 3b. Slower, as expected, and nowhere near a bottleneck.
+
+What remains untried is the **4-GPU FSDP path** — see
+[Known rough edges](#known-rough-edges).
 
 ### Debugging a failure
 
